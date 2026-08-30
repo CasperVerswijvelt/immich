@@ -26,11 +26,13 @@ import {
 } from 'src/enum';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import {
+  Bitmap,
   DecodeToBufferOptions,
   GenerateThumbhashOptions,
   GenerateThumbnailOptions,
   ImageDimensions,
   ProbeOptions,
+  TransformOptions,
   TranscodeCommand,
   VideoInfo,
   VideoPacketInfo,
@@ -145,14 +147,12 @@ export class MediaRepository {
     }
   }
 
-  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
-    // Raw output carries no profile, so this is the resampled pixels without the re-tagging step.
-    return options.size === undefined
-      ? this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true })
-      : this.getResampledRaw(options, input, options.size, 'outside');
+  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions): Promise<Bitmap> {
+    const decoded = await this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });
+    return this.transform(decoded, options);
   }
 
-  private applyEdits(pipeline: sharp.Sharp, edits: AssetEditActionItem[]): sharp.Sharp {
+  private edit(pipeline: sharp.Sharp, edits: AssetEditActionItem[]): sharp.Sharp {
     const crop = edits.find((edit) => edit.action === 'crop');
     if (crop) {
       pipeline = pipeline.extract({
@@ -175,9 +175,9 @@ export class MediaRepository {
     return pipeline;
   }
 
-  async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {
-    const pipeline = await this.getPipeline(input, options);
-    await pipeline
+  async generateThumbnail(image: Bitmap, options: GenerateThumbnailOptions, output: string): Promise<void> {
+    const transformed = await this.transform(image, options);
+    await this.tag(transformed, options.colorspace)
       .toFormat(options.format, {
         quality: options.quality,
         // this is default in libvips (except the threshold is 90), but we need to set it manually in sharp
@@ -188,31 +188,19 @@ export class MediaRepository {
   }
 
   private getImageDecodingPipeline(input: string | Buffer, options: DecodeToBufferOptions) {
-    let pipeline = sharp(input, {
-      // some invalid images can still be processed by sharp, but we want to fail on them by default to avoid crashes
-      failOn: options.processInvalidImages ? 'none' : 'error',
-      limitInputChannels: false,
-      limitInputPixels: false,
-      raw: options.raw,
-      unlimited: true,
-    })
+    // some invalid images can still be processed by sharp, but we want to fail on them by default to avoid crashes
+    let pipeline = this.encoded(input, options.processInvalidImages ? 'none' : 'error')
       .pipelineColorspace(this.getPipelineColorspace(options.colorspace))
       .withIccProfile(options.colorspace);
 
-    if (!options.raw) {
-      const { angle, flip, flop } = options.orientation ? ORIENTATION_TO_SHARP_ROTATION[options.orientation] : {};
-      pipeline = pipeline.rotate(angle);
-      if (flip) {
-        pipeline = pipeline.flip();
-      }
-
-      if (flop) {
-        pipeline = pipeline.flop();
-      }
+    const { angle, flip, flop } = options.orientation ? ORIENTATION_TO_SHARP_ROTATION[options.orientation] : {};
+    pipeline = pipeline.rotate(angle);
+    if (flip) {
+      pipeline = pipeline.flip();
     }
 
-    if (options.edits && options.edits.length > 0) {
-      pipeline = this.applyEdits(pipeline, options.edits);
+    if (flop) {
+      pipeline = pipeline.flop();
     }
 
     return pipeline;
@@ -222,80 +210,41 @@ export class MediaRepository {
     return colorspace === Colorspace.Srgb ? 'srgb' : 'rgb16';
   }
 
-  private async getPipeline(input: string | Buffer, options: DecodeToBufferOptions) {
-    return options.size === undefined
-      ? this.getImageDecodingPipeline(input, options)
-      : this.getResamplingPipeline(input, options, options.size, 'outside');
-  }
-
   /**
-   * Resample in linear light. Averaging gamma-encoded values darkens the result, and the error
-   * grows with the downscale factor, so it is worst on the smallest thumbnails.
-   *
-   * scRGB is only safe on pixels that carry no profile: sharp applies the input ICC transform
-   * after the pipeline colourspace is set, so a profiled input yields a black image. Encoded input
-   * is therefore converted to raw first; a caller passing raw has already had that done for it.
+   * Resamples in linear light; averaging gamma-encoded values darkens the result. scRGB only works
+   * on untagged pixels, because sharp applies the input ICC transform after the pipeline
+   * colourspace is set, and a profiled input then decodes to black.
    */
-  private async getResampledRaw(
-    options: DecodeToBufferOptions,
-    input: string | Buffer,
-    size: number,
-    fit: keyof sharp.FitEnum,
-  ) {
-    const source = options.raw
-      ? { data: input as Buffer, info: options.raw }
-      : await this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });
-
-    let pipeline = sharp(source.data, {
-      raw: source.info,
-      limitInputChannels: false,
-      limitInputPixels: false,
-      unlimited: true,
-    }).pipelineColorspace('scrgb');
-
-    // Encoded input has already had these applied while it was being decoded.
-    if (options.raw && options.edits && options.edits.length > 0) {
-      pipeline = this.applyEdits(pipeline, options.edits);
+  private transform(image: Bitmap, { size, fit = 'outside', edits = [] }: TransformOptions): Promise<Bitmap> {
+    if (!size && !edits.length) {
+      return Promise.resolve(image);
     }
 
-    return pipeline.resize(size, size, { fit, withoutEnlargement: true }).raw().toBuffer({ resolveWithObject: true });
+    return this.edit(this.raw(image).pipelineColorspace('scrgb'), edits)
+      .resize(size, size, { fit, withoutEnlargement: true })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
   }
 
-  /** Re-attaches the profile. Converts nothing: `withIccProfile` converts from the pipeline
-   * colourspace's own profile, which is the one the pixels are already in. */
-  private async getResamplingPipeline(
-    input: string | Buffer,
-    options: DecodeToBufferOptions,
-    size: number,
-    fit: keyof sharp.FitEnum,
-  ) {
-    const resized = await this.getResampledRaw(options, input, size, fit);
-    return sharp(resized.data, {
-      raw: resized.info,
-      limitInputChannels: false,
-      limitInputPixels: false,
-      unlimited: true,
-    })
-      .pipelineColorspace(this.getPipelineColorspace(options.colorspace))
-      .withIccProfile(options.colorspace);
+  private raw({ data, info: raw }: Bitmap) {
+    return sharp(data, { raw, limitInputChannels: false, limitInputPixels: false, unlimited: true });
   }
 
-  async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {
+  private encoded(image: string | Buffer, failOn: 'none' | 'error') {
+    return sharp(image, { failOn, limitInputChannels: false, limitInputPixels: false, unlimited: true });
+  }
+
+  /** Re-attaches the profile, converting nothing: the pixels are already in that colourspace. */
+  private tag(image: Bitmap, colorspace: string): sharp.Sharp {
+    return this.raw(image).pipelineColorspace(this.getPipelineColorspace(colorspace)).withIccProfile(colorspace);
+  }
+
+  async generateThumbhash(image: Bitmap, options: GenerateThumbhashOptions): Promise<Buffer> {
     const { rgbaToThumbHash } = await import('thumbhash');
 
-    const resampled = await this.getResampledRaw(
-      {
-        colorspace: options.colorspace,
-        processInvalidImages: options.processInvalidImages,
-        raw: options.raw,
-        edits: options.edits,
-      },
-      input,
-      100,
-      'inside',
-    );
+    const transformed = await this.transform(image, { edits: options.edits, fit: 'inside', size: 100 });
 
-    const { data, info } = await sharp(resampled.data, { raw: resampled.info })
+    const { data, info } = await sharp(transformed.data, { raw: transformed.info })
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
