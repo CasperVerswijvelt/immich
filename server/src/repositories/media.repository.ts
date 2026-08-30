@@ -145,8 +145,11 @@ export class MediaRepository {
     }
   }
 
-  decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
-    return this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });
+  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
+    // Raw output carries no profile, so this is the resampled pixels without the re-tagging step.
+    return options.size === undefined
+      ? this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true })
+      : this.getResampledRaw(options, input, options.size, 'outside');
   }
 
   private applyEdits(pipeline: sharp.Sharp, edits: AssetEditActionItem[]): sharp.Sharp {
@@ -173,7 +176,8 @@ export class MediaRepository {
   }
 
   async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {
-    await this.getImageDecodingPipeline(input, options)
+    const pipeline = await this.getPipeline(input, options);
+    await pipeline
       .toFormat(options.format, {
         quality: options.quality,
         // this is default in libvips (except the threshold is 90), but we need to set it manually in sharp
@@ -192,7 +196,7 @@ export class MediaRepository {
       raw: options.raw,
       unlimited: true,
     })
-      .pipelineColorspace(options.colorspace === Colorspace.Srgb ? 'srgb' : 'rgb16')
+      .pipelineColorspace(this.getPipelineColorspace(options.colorspace))
       .withIccProfile(options.colorspace);
 
     if (!options.raw) {
@@ -211,24 +215,89 @@ export class MediaRepository {
       pipeline = this.applyEdits(pipeline, options.edits);
     }
 
-    if (options.size !== undefined) {
-      pipeline = pipeline.resize(options.size, options.size, { fit: 'outside', withoutEnlargement: true });
-    }
     return pipeline;
+  }
+
+  private getPipelineColorspace(colorspace: string) {
+    return colorspace === Colorspace.Srgb ? 'srgb' : 'rgb16';
+  }
+
+  private async getPipeline(input: string | Buffer, options: DecodeToBufferOptions) {
+    return options.size === undefined
+      ? this.getImageDecodingPipeline(input, options)
+      : this.getResamplingPipeline(input, options, options.size, 'outside');
+  }
+
+  /**
+   * Resample in linear light. Averaging gamma-encoded values darkens the result, and the error
+   * grows with the downscale factor, so it is worst on the smallest thumbnails.
+   *
+   * scRGB is only safe on pixels that carry no profile: sharp applies the input ICC transform
+   * after the pipeline colourspace is set, so a profiled input yields a black image. Encoded input
+   * is therefore converted to raw first; a caller passing raw has already had that done for it.
+   */
+  private async getResampledRaw(
+    options: DecodeToBufferOptions,
+    input: string | Buffer,
+    size: number,
+    fit: keyof sharp.FitEnum,
+  ) {
+    const source = options.raw
+      ? { data: input as Buffer, info: options.raw }
+      : await this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });
+
+    let pipeline = sharp(source.data, {
+      raw: source.info,
+      limitInputChannels: false,
+      limitInputPixels: false,
+      unlimited: true,
+    }).pipelineColorspace('scrgb');
+
+    // Encoded input has already had these applied while it was being decoded.
+    if (options.raw && options.edits && options.edits.length > 0) {
+      pipeline = this.applyEdits(pipeline, options.edits);
+    }
+
+    return pipeline.resize(size, size, { fit, withoutEnlargement: true }).raw().toBuffer({ resolveWithObject: true });
+  }
+
+  /** Re-attaches the profile. Converts nothing: `withIccProfile` converts from the pipeline
+   * colourspace's own profile, which is the one the pixels are already in. */
+  private async getResamplingPipeline(
+    input: string | Buffer,
+    options: DecodeToBufferOptions,
+    size: number,
+    fit: keyof sharp.FitEnum,
+  ) {
+    const resized = await this.getResampledRaw(options, input, size, fit);
+    return sharp(resized.data, {
+      raw: resized.info,
+      limitInputChannels: false,
+      limitInputPixels: false,
+      unlimited: true,
+    })
+      .pipelineColorspace(this.getPipelineColorspace(options.colorspace))
+      .withIccProfile(options.colorspace);
   }
 
   async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {
     const { rgbaToThumbHash } = await import('thumbhash');
 
-    const { data, info } = await this.getImageDecodingPipeline(input, {
-      colorspace: options.colorspace,
-      processInvalidImages: options.processInvalidImages,
-      raw: options.raw,
-      edits: options.edits,
-    })
-      .resize(100, 100, { fit: 'inside', withoutEnlargement: true })
-      .raw()
+    const resampled = await this.getResampledRaw(
+      {
+        colorspace: options.colorspace,
+        processInvalidImages: options.processInvalidImages,
+        raw: options.raw,
+        edits: options.edits,
+      },
+      input,
+      100,
+      'inside',
+    );
+
+    const { data, info } = await sharp(resampled.data, { raw: resampled.info })
       .ensureAlpha()
+      .raw()
       .toBuffer({ resolveWithObject: true });
 
     return Buffer.from(rgbaToThumbHash(info.width, info.height, data));
