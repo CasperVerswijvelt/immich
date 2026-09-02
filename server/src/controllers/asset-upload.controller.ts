@@ -77,7 +77,9 @@ export class AssetUploadController {
 
     res.set({
       'Tus-Resumable': TUS_VERSION,
-      Location: `${req.baseUrl}/${id}`,
+      // req.path, not req.baseUrl: Nest registers routes straight onto express, so there is no
+      // mounted router and baseUrl is empty.
+      Location: `${req.path.replace(/\/$/, '')}/${id}`,
       'Upload-Expires': expiresAt,
     });
   }

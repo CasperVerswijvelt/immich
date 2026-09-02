@@ -99,6 +99,9 @@ export class AssetUploadService {
    * upload id resolves under the caller's own folder and simply is not found.
    */
   async getState(auth: AuthDto, id: string): Promise<UploadState> {
+    // getUploadFolder mkdirs as a side effect, so probing an unknown id leaves an empty directory
+    // behind. Bounded (two nesting levels per user) and the same directories real uploads use, and
+    // keeping this seam mockable is worth more than avoiding them.
     const folder = this.assetMediaService.getUploadFolder(this.asUploadRequest(auth, id, ''));
     const jsonPath = join(folder, `${id}.json`);
 
