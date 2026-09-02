@@ -375,6 +375,84 @@ export const utils = {
     return body as AssetMediaResponseDto;
   },
 
+  /**
+   * Upload an asset over the tus resumable API, with the same signature as [createAsset] so tests
+   * can be parametrized over both transports.
+   */
+  createAssetResumable: async (
+    accessToken: string,
+    dto?: Partial<Omit<AssetMediaCreateDto, 'assetData' | 'sidecarData'>> & {
+      assetData?: FileData;
+      sidecarData?: FileData;
+    },
+    options?: { chunkSize?: number },
+  ) => {
+    const _dto = {
+      fileCreatedAt: new Date().toISOString(),
+      fileModifiedAt: new Date().toISOString(),
+      ...dto,
+    };
+
+    const bytes = dto?.assetData?.bytes || makeRandomImage();
+    const filename = dto?.assetData?.filename || 'example.png';
+    const chunkSize = options?.chunkSize ?? bytes.length;
+
+    const metadata = Object.entries({ ..._dto, filename })
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => `${key} ${Buffer.from(String(value), 'utf8').toString('base64')}`)
+      .join(',');
+
+    const created = await request(app)
+      .post('/assets/upload')
+      .set('Authorization', `Bearer ${accessToken}`)
+      .set('Tus-Resumable', '1.0.0')
+      .set('Upload-Length', String(bytes.length))
+      .set('Upload-Metadata', metadata)
+      .set('x-immich-checksum', createHash('sha1').update(bytes).digest('hex'));
+
+    if (created.status === 200) {
+      return created.body as AssetMediaResponseDto;
+    }
+
+    if (created.status !== 201) {
+      throw new Error(`Unable to start a resumable upload: ${created.status} ${created.text}`);
+    }
+
+    const location = created.headers.location;
+
+    if (dto?.sidecarData?.bytes) {
+      await request(app)
+        .put(`${location.replace('/api', '')}/sidecar`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .set('Tus-Resumable', '1.0.0')
+        .set('Content-Type', 'application/xml')
+        .send(dto.sidecarData.bytes);
+    }
+
+    for (let offset = 0; offset < bytes.length;) {
+      const end = Math.min(offset + chunkSize, bytes.length);
+      const response = await request(app)
+        .patch(location.replace('/api', ''))
+        .set('Authorization', `Bearer ${accessToken}`)
+        .set('Tus-Resumable', '1.0.0')
+        .set('Upload-Offset', String(offset))
+        .set('Content-Type', 'application/offset+octet-stream')
+        .send(bytes.subarray(offset, end));
+
+      if (response.status === 200 || response.status === 201) {
+        return response.body as AssetMediaResponseDto;
+      }
+
+      if (response.status !== 204) {
+        throw new Error(`Resumable upload failed: ${response.status} ${response.text}`);
+      }
+
+      offset = Number(response.headers['upload-offset'] ?? end);
+    }
+
+    throw new Error('Resumable upload finished without a response from the server');
+  },
+
   createImageFile: (path: string) => {
     if (!existsSync(dirname(path))) {
       mkdirSync(dirname(path), { recursive: true });
