@@ -449,7 +449,10 @@ void main() {
       expect(task.post, 'binary');
       expect(task.url, 'http://test-server.com/assets/upload/abc');
       expect(task.headers['Upload-Offset'], '0');
-      expect(task.headers['Content-Type'], 'application/offset+octet-stream');
+      // must be the task's mimeType, not a header: both platforms overwrite Content-Type with
+      // mimeType for binary uploads, so a header would be discarded and the chunk rejected
+      expect(task.mimeType, 'application/offset+octet-stream');
+      expect(task.headers.containsKey('Content-Type'), isFalse);
       // the plugin consumes Range to slice the file; it is never forwarded
       expect(task.headers['Range'], 'bytes=0-${kUploadChunkSize - 1}');
 

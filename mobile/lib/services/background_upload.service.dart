@@ -622,10 +622,13 @@ class BackgroundUploadService {
         'Range': rangeHeader(range.start, range.end),
         'Tus-Resumable': kTusVersion,
         'Upload-Offset': '$offset',
-        'Content-Type': kTusOffsetContentType,
         // an empty value omits the header the plugin would otherwise add for binary uploads
         'Content-Disposition': '',
       },
+      // NOT a Content-Type header: for binary uploads both platforms overwrite Content-Type with
+      // the task's mimeType (UploadTaskRunner.kt:231, BDPlugin.swift:390), so a header here is
+      // silently discarded and the server would reject the chunk with 400.
+      mimeType: kTusOffsetContentType,
       filename: filename,
       baseDirectory: baseDirectory,
       directory: directory,
