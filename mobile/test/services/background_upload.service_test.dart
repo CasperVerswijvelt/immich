@@ -1,7 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:drift/drift.dart' hide isNull, isNotNull;
+import 'package:background_downloader/background_downloader.dart';
+import 'package:drift/drift.dart' hide isNotNull, isNull;
 import 'package:drift/native.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -13,7 +14,9 @@ import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/infrastructure/repositories/db.repository.dart';
 import 'package:immich_mobile/infrastructure/repositories/settings.repository.dart';
 import 'package:immich_mobile/infrastructure/repositories/store.repository.dart';
+import 'package:immich_mobile/repositories/upload.repository.dart';
 import 'package:immich_mobile/services/background_upload.service.dart';
+import 'package:immich_mobile/utils/tus.dart';
 import 'package:mocktail/mocktail.dart';
 
 import '../fixtures/asset.stub.dart';
@@ -401,6 +404,220 @@ void main() {
       expect(metadata, hasLength(1));
       expect(metadata[0]['key'], equals('mobile-app'));
       expect(metadata[0]['value']['iCloudId'], equals('cloud-id-livephoto'));
+    });
+  });
+
+  group('resumable uploads', () {
+    /// A sparse file, so a >16MiB fixture costs no real disk or memory.
+    File sparseFile(String name, int size) {
+      final file = File('${Directory.systemTemp.createTempSync().path}/$name');
+      final handle = file.openSync(mode: FileMode.write);
+      handle.setPositionSync(size - 1);
+      handle.writeByteSync(0);
+      handle.closeSync();
+      return file;
+    }
+
+    const large = kUploadChunkSize * 2 + 100;
+
+    Future<UploadTask?> taskFor(LocalAsset asset, File file, {bool isLivePhoto = false}) async {
+      final mockEntity = MockAssetEntity();
+      when(() => mockEntity.isLivePhoto).thenReturn(isLivePhoto);
+      when(() => mockStorageRepository.getAssetEntityForAsset(asset)).thenAnswer((_) async => mockEntity);
+      when(() => mockStorageRepository.getFileForAsset(asset.id)).thenAnswer((_) async => file);
+      when(() => mockStorageRepository.getMotionFileForAsset(asset)).thenAnswer((_) async => file);
+      when(() => mockAssetMediaRepository.getOriginalFilename(asset.id)).thenAnswer((_) async => 'video.mp4');
+      return sut.getUploadTask(asset);
+    }
+
+    final hashed = LocalAssetStub.image1.copyWith(checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=');
+
+    test('sends a large hashed asset as a tus PATCH chunk', () async {
+      when(
+        () => mockUploadRepository.createResumableSession(
+          size: any(named: 'size'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: any(named: 'checksum'),
+          fields: any(named: 'fields'),
+        ),
+      ).thenAnswer((_) async => ResumableSession(url: Uri.parse('http://test-server.com/assets/upload/abc')));
+
+      final task = await taskFor(hashed, sparseFile('video.mp4', large));
+
+      expect(task, isNotNull);
+      expect(task!.httpRequestMethod, 'PATCH');
+      expect(task.post, 'binary');
+      expect(task.url, 'http://test-server.com/assets/upload/abc');
+      expect(task.headers['Upload-Offset'], '0');
+      expect(task.headers['Content-Type'], 'application/offset+octet-stream');
+      // the plugin consumes Range to slice the file; it is never forwarded
+      expect(task.headers['Range'], 'bytes=0-${kUploadChunkSize - 1}');
+
+      final metadata = UploadTaskMetadata.fromJson(task.metaData);
+      expect(metadata.isChunk, isTrue);
+      expect(metadata.isFinalChunk, isFalse);
+      expect(metadata.uploadTotal, large);
+    });
+
+    test('falls back to a single request when the server has no resumable api', () async {
+      when(
+        () => mockUploadRepository.createResumableSession(
+          size: any(named: 'size'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: any(named: 'checksum'),
+          fields: any(named: 'fields'),
+        ),
+      ).thenAnswer((_) async => null);
+
+      final task = await taskFor(hashed, sparseFile('video.mp4', large));
+
+      expect(task!.httpRequestMethod, 'POST');
+      expect(task.fields['filename'], 'video.mp4');
+    });
+
+    test('falls back to a single request when the session cannot be created', () async {
+      when(
+        () => mockUploadRepository.createResumableSession(
+          size: any(named: 'size'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: any(named: 'checksum'),
+          fields: any(named: 'fields'),
+        ),
+      ).thenThrow(StateError('boom'));
+
+      final task = await taskFor(hashed, sparseFile('video.mp4', large));
+
+      expect(task!.httpRequestMethod, 'POST');
+    });
+
+    test('skips the upload entirely when the server already has the file', () async {
+      when(
+        () => mockUploadRepository.createResumableSession(
+          size: any(named: 'size'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: any(named: 'checksum'),
+          fields: any(named: 'fields'),
+        ),
+      ).thenAnswer((_) async => ResumableSession(duplicate: UploadResult.success(remoteAssetId: 'existing')));
+
+      expect(await taskFor(hashed, sparseFile('video.mp4', large)), isNull);
+    });
+
+    test('leaves small files on the single-request path', () async {
+      final task = await taskFor(hashed, sparseFile('photo.jpg', 1024));
+
+      expect(task!.httpRequestMethod, 'POST');
+      verifyNever(
+        () => mockUploadRepository.createResumableSession(
+          size: any(named: 'size'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: any(named: 'checksum'),
+          fields: any(named: 'fields'),
+        ),
+      );
+    });
+
+    test('leaves an unhashed asset on the single-request path', () async {
+      final task = await taskFor(LocalAssetStub.image1, sparseFile('video.mp4', large));
+
+      expect(task!.httpRequestMethod, 'POST');
+    });
+
+    test('leaves live photos on the single-request path', () async {
+      final task = await taskFor(hashed, sparseFile('video.mov', large), isLivePhoto: true);
+
+      expect(task!.httpRequestMethod, 'POST');
+    });
+
+    group('chunk chaining', () {
+      late File file;
+      late UploadTask task;
+
+      setUp(() async {
+        file = sparseFile('video.mp4', large);
+        when(() => mockUploadRepository.enqueueBackgroundAll(any())).thenAnswer((_) async => [true]);
+
+        task = await sut.buildChunkTask(
+          file,
+          uploadUrl: Uri.parse('http://test-server.com/assets/upload/abc'),
+          offset: 0,
+          total: large,
+          group: 'backup',
+          metadata: const UploadTaskMetadata(
+            localAssetId: 'asset-1',
+            isLivePhotos: false,
+            livePhotoVideoId: '',
+            uploadUrl: 'http://test-server.com/assets/upload/abc',
+            uploadOffset: 0,
+            uploadTotal: large,
+          ).toJson(),
+          deviceAssetId: 'asset-1',
+        );
+      });
+
+      List<UploadTask> enqueued() {
+        final captured = verify(() => mockUploadRepository.enqueueBackgroundAll(captureAny())).captured;
+        return captured.expand((tasks) => tasks as List<UploadTask>).toList();
+      }
+
+      test('queues the next chunk at the offset the server reports', () async {
+        await sut.handleTaskStatusUpdate(
+          TaskStatusUpdate(task, TaskStatus.complete, null, null, {'upload-offset': '$kUploadChunkSize'}),
+        );
+
+        final next = enqueued().single;
+        expect(next.headers['Upload-Offset'], '$kUploadChunkSize');
+        expect(UploadTaskMetadata.fromJson(next.metaData).uploadOffset, kUploadChunkSize);
+      });
+
+      test('falls back to its own arithmetic when the server sends no offset', () async {
+        await sut.handleTaskStatusUpdate(TaskStatusUpdate(task, TaskStatus.complete));
+
+        expect(enqueued().single.headers['Upload-Offset'], '$kUploadChunkSize');
+      });
+
+      test('does not queue anything after the final chunk', () async {
+        final finalTask = await sut.buildChunkTask(
+          file,
+          uploadUrl: Uri.parse('http://test-server.com/assets/upload/abc'),
+          offset: kUploadChunkSize * 2,
+          total: large,
+          group: 'backup',
+          metadata: const UploadTaskMetadata(
+            localAssetId: 'asset-1',
+            isLivePhotos: false,
+            livePhotoVideoId: '',
+            uploadUrl: 'http://test-server.com/assets/upload/abc',
+            uploadOffset: kUploadChunkSize * 2,
+            uploadTotal: large,
+          ).toJson(),
+          deviceAssetId: 'asset-1',
+        );
+
+        await sut.handleTaskStatusUpdate(TaskStatusUpdate(finalTask, TaskStatus.complete));
+
+        verifyNever(() => mockUploadRepository.enqueueBackgroundAll(any()));
+      });
+
+      test('resumes from the server offset when a chunk fails with a conflict', () async {
+        await sut.handleTaskStatusUpdate(
+          TaskStatusUpdate(task, TaskStatus.failed, null, null, {'upload-offset': '4096'}),
+        );
+
+        expect(enqueued().single.headers['Upload-Offset'], '4096');
+      });
+
+      test('does not loop when a failure repeats the same offset', () async {
+        await sut.handleTaskStatusUpdate(TaskStatusUpdate(task, TaskStatus.failed, null, null, {'upload-offset': '0'}));
+
+        verifyNever(() => mockUploadRepository.enqueueBackgroundAll(any()));
+      });
+
+      test('ignores a failure with no offset to resume from', () async {
+        await sut.handleTaskStatusUpdate(TaskStatusUpdate(task, TaskStatus.failed));
+
+        verifyNever(() => mockUploadRepository.enqueueBackgroundAll(any()));
+      });
     });
   });
 }
