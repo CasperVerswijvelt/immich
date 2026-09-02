@@ -118,3 +118,33 @@ services:
 
 Keep in mind, that Traefik needs to communicate with the network where immich is in, usually done
 by adding the Traefik network to the `immich-server`.
+
+## Resumable uploads and proxy body limits
+
+Immich supports resumable, chunked uploads using the [tus](https://tus.io) protocol. Clients split
+large files into 16 MiB chunks, so a proxy that caps request bodies — Cloudflare's limit is 100 MB —
+no longer blocks large videos, and an interrupted upload resumes from where it stopped instead of
+starting over.
+
+Clients fall back to a single-request upload automatically when the server does not support this, so
+nothing breaks on an older server. For the chunked path to work, your reverse proxy must:
+
+- **Allow the `OPTIONS`, `HEAD`, `PATCH` and `DELETE` methods** on `/api/assets/upload/*`. Some WAF
+  rulesets and Apache `ProxyPass` configurations restrict methods to `GET`/`POST` by default.
+- **Forward the `Tus-Resumable`, `Upload-Offset`, `Upload-Length`, `Upload-Metadata` and
+  `Upload-Expires` headers in both directions.** A proxy that strips unknown headers breaks
+  resumption, and the symptom is confusing: the upload appears to loop, re-sending the first chunk.
+- **Allow a request body of at least the chunk size.** nginx's `client_max_body_size` default is
+  **1 MB**, well under the 16 MiB chunk size.
+- **Not buffer request bodies** (`proxy_request_buffering off;` in the nginx example above).
+
+:::tip Cloudflare Tunnel
+With a client that supports resumable uploads there is no workaround needed for Cloudflare's 100 MB
+request limit — each chunk is well under it. You still need a recent client: the mobile app, web app
+and CLI all negotiate this automatically.
+:::
+
+:::info
+`client_max_body_size 50000M` in the nginx example above is only needed for clients that upload in a
+single request. Leaving it in place is harmless.
+:::
