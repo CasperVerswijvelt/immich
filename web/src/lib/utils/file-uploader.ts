@@ -17,6 +17,7 @@ import { uploadAssetsStore } from '$lib/stores/upload';
 import { UploadState } from '$lib/types';
 import { uploadRequest } from '$lib/utils';
 import { ExecutorQueue } from '$lib/utils/executor-queue';
+import { resumableUpload, shouldUseResumableUpload } from '$lib/utils/resumable-upload';
 import { asQueryString } from '$lib/utils/shared-links';
 import { handleError } from './handle-error';
 
@@ -196,11 +197,12 @@ async function fileUploader({
     }
 
     let responseData: { id: string; status: AssetMediaStatus; isTrashed?: boolean } | undefined;
+    let checksum: string | undefined;
     if (!authManager.isSharedLink) {
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_hashing') });
       await tick();
       try {
-        const checksum = await hashFile(assetFile);
+        checksum = await hashFile(assetFile);
 
         const {
           results: [checkUploadResult],
@@ -215,6 +217,35 @@ async function fileUploader({
       } catch (error) {
         console.error(`Error calculating sha1 file=${assetFile.name})`, error);
       }
+    }
+
+    // Shared links skip the dedupe pre-check above (it needs auth) and so never got a checksum,
+    // but resumable uploads need one - and a public upload link behind a proxy with a body cap is
+    // exactly the case this feature exists for.
+    if (!checksum && authManager.isSharedLink && shouldUseResumableUpload(assetFile.size)) {
+      try {
+        uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_hashing') });
+        await tick();
+        checksum = await hashFile(assetFile);
+      } catch (error) {
+        console.error(`Error calculating sha1 file=${assetFile.name})`, error);
+      }
+    }
+
+    if (!responseData && checksum && shouldUseResumableUpload(assetFile.size)) {
+      uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_uploading') });
+      responseData = await resumableUpload({
+        file: assetFile,
+        checksum,
+        metadata: {
+          fileCreatedAt,
+          fileModifiedAt: new Date(assetFile.lastModified).toISOString(),
+          isFavorite: 'false',
+          visibility: isLockedAssets ? AssetVisibility.Locked : undefined,
+        },
+        queryParams: asQueryString(authManager.params),
+        onProgress: (loaded, total) => uploadAssetsStore.updateProgress(deviceAssetId, loaded, total),
+      });
     }
 
     if (!responseData) {
