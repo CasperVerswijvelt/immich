@@ -22,6 +22,7 @@ import 'package:immich_mobile/repositories/asset_media.repository.dart';
 import 'package:immich_mobile/repositories/upload.repository.dart';
 import 'package:immich_mobile/services/api.service.dart';
 import 'package:immich_mobile/utils/debug_print.dart';
+import 'package:immich_mobile/utils/tus.dart';
 import 'package:logging/logging.dart';
 import 'package:openapi/api.dart' as api;
 import 'package:path/path.dart' as p;
@@ -51,13 +52,29 @@ abstract class UploadTaskMetadata with _$UploadTaskMetadata {
     required String localAssetId,
     required bool isLivePhotos,
     required String livePhotoVideoId,
+
+    /// tus session URL, when this task is one chunk of a resumable upload.
+    String? uploadUrl,
+
+    /// Byte offset this chunk starts at, and the total size of the file.
+    int? uploadOffset,
+    int? uploadTotal,
   }) = _UploadTaskMetadata;
+
+  /// Whether this task is one chunk of a resumable upload rather than a whole-file request.
+  bool get isChunk => uploadUrl != null;
+
+  /// Whether this chunk is the last one, i.e. its completion finalizes the asset.
+  bool get isFinalChunk => isChunk && chunkRange(uploadOffset!, uploadTotal!).end >= uploadTotal!;
 
   Map<String, dynamic> toMap() {
     return <String, dynamic>{
       'localAssetId': localAssetId,
       'isLivePhotos': isLivePhotos,
       'livePhotoVideoId': livePhotoVideoId,
+      if (uploadUrl != null) 'uploadUrl': uploadUrl,
+      if (uploadOffset != null) 'uploadOffset': uploadOffset,
+      if (uploadTotal != null) 'uploadTotal': uploadTotal,
     };
   }
 
@@ -66,6 +83,9 @@ abstract class UploadTaskMetadata with _$UploadTaskMetadata {
       localAssetId: map['localAssetId'] as String,
       isLivePhotos: map['isLivePhotos'] as bool,
       livePhotoVideoId: map['livePhotoVideoId'] as String,
+      uploadUrl: map['uploadUrl'] as String?,
+      uploadOffset: map['uploadOffset'] as int?,
+      uploadTotal: map['uploadTotal'] as int?,
     );
   }
 
@@ -116,7 +136,7 @@ class BackgroundUploadService {
     if (!_taskStatusController.isClosed) {
       _taskStatusController.add(update);
     }
-    unawaited(_handleTaskStatusUpdate(update));
+    unawaited(handleTaskStatusUpdate(update));
   }
 
   void dispose() {
@@ -186,9 +206,15 @@ class BackgroundUploadService {
     return _uploadRepository.start();
   }
 
-  Future<void> _handleTaskStatusUpdate(TaskStatusUpdate update) async {
+  @visibleForTesting
+  Future<void> handleTaskStatusUpdate(TaskStatusUpdate update) async {
     switch (update.status) {
       case TaskStatus.complete:
+        // A chunk completing is not an asset completing: queue the next one and leave the file be.
+        if (await _enqueueNextChunk(update)) {
+          return;
+        }
+
         unawaited(_handleLivePhoto(update));
 
         if (CurrentPlatform.isIOS) {
@@ -200,8 +226,83 @@ class BackgroundUploadService {
           }
         }
 
+      case TaskStatus.failed:
+        // A 409 means our offset was stale; the response carries the real one, so resume there
+        // rather than failing the whole asset.
+        await _resumeFromServerOffset(update);
+
       default:
         break;
+    }
+  }
+
+  UploadTaskMetadata? _metadataOf(Task task) {
+    if (task.metaData.isEmpty) {
+      return null;
+    }
+
+    try {
+      return UploadTaskMetadata.fromJson(task.metaData);
+    } catch (error) {
+      dPrint(() => "Unparseable upload task metadata: $error");
+      return null;
+    }
+  }
+
+  /// Queue the chunk following the one that just completed.
+  /// Returns whether this task was a non-final chunk, i.e. whether the asset is still in flight.
+  Future<bool> _enqueueNextChunk(TaskStatusUpdate update) async {
+    final metadata = _metadataOf(update.task);
+    if (metadata == null || !metadata.isChunk || metadata.isFinalChunk) {
+      return false;
+    }
+
+    // the server's offset is authoritative; fall back to our own arithmetic if it is absent
+    final offset =
+        parseUploadOffset(update.responseHeaders) ?? chunkRange(metadata.uploadOffset!, metadata.uploadTotal!).end;
+
+    await _enqueueChunkAt(update.task, metadata, offset);
+    return true;
+  }
+
+  Future<void> _resumeFromServerOffset(TaskStatusUpdate update) async {
+    final metadata = _metadataOf(update.task);
+    if (metadata == null || !metadata.isChunk) {
+      return;
+    }
+
+    final offset = parseUploadOffset(update.responseHeaders);
+    if (offset == null || offset == metadata.uploadOffset) {
+      _logger.warning("Resumable upload ${metadata.localAssetId} stalled at ${metadata.uploadOffset}");
+      return;
+    }
+
+    _logger.info("Resuming ${metadata.localAssetId} from the server's offset $offset");
+    await _enqueueChunkAt(update.task, metadata, offset);
+  }
+
+  Future<void> _enqueueChunkAt(Task task, UploadTaskMetadata metadata, int offset) async {
+    if (offset >= metadata.uploadTotal!) {
+      return;
+    }
+
+    try {
+      final file = File(await task.filePath());
+      final next = await buildChunkTask(
+        file,
+        uploadUrl: Uri.parse(metadata.uploadUrl!),
+        offset: offset,
+        total: metadata.uploadTotal!,
+        group: task.group,
+        metadata: metadata.copyWith(uploadOffset: offset).toJson(),
+        deviceAssetId: metadata.localAssetId,
+        priority: task.priority,
+        requiresWiFi: task.requiresWiFi,
+      );
+
+      await enqueueTasks([next]);
+    } catch (error, stackTrace) {
+      _logger.severe(() => "Failed to queue the next upload chunk: $error", stackTrace);
     }
   }
 
@@ -282,6 +383,28 @@ class BackgroundUploadService {
 
     final requiresWiFi = _shouldRequireWiFi(asset);
 
+    // Large files go up in chunks so a reverse proxy with a request-body cap (Cloudflare's is
+    // 100MB) does not block them and a dropped connection does not cost the whole transfer.
+    // Live photos are excluded: the motion file has no checksum of its own and is small.
+    if (!entity.isLivePhoto && asset.checksum != null) {
+      final chunked = await _getFirstChunkTask(
+        asset,
+        file,
+        checksum: asset.checksum!,
+        originalFileName: originalFileName,
+        metadata: metadata,
+        group: group,
+        priority: priority,
+        requiresWiFi: requiresWiFi,
+      );
+
+      // `handled` distinguishes "the resumable path owns this asset" - including the case where
+      // the server already has it and nothing should be uploaded - from "fall back to multipart".
+      if (chunked.handled) {
+        return chunked.task;
+      }
+    }
+
     return buildUploadTask(
       file,
       createdAt: asset.createdAt,
@@ -346,6 +469,119 @@ class BackgroundUploadService {
       return false;
     }
     return true;
+  }
+
+  /// Create a tus session for [asset] and return the task for its first chunk.
+  ///
+  /// Returns null when the file is small enough to send in one request, or when the server has no
+  /// resumable upload API, so the caller falls back to the multipart task.
+  Future<({bool handled, UploadTask? task})> _getFirstChunkTask(
+    LocalAsset asset,
+    File file, {
+    required String checksum,
+    required String originalFileName,
+    required String metadata,
+    required String group,
+    required bool requiresWiFi,
+    int? priority,
+  }) async {
+    try {
+      final total = await file.length();
+      if (!shouldUseResumableUpload(total)) {
+        return (handled: false, task: null);
+      }
+
+      final session = await _uploadRepository.createResumableSession(
+        size: total,
+        originalFileName: originalFileName,
+        checksum: checksum,
+        fields: {
+          'fileCreatedAt': asset.createdAt.toUtc().toIso8601String(),
+          'fileModifiedAt': asset.updatedAt.toUtc().toIso8601String(),
+          'isFavorite': asset.isFavorite.toString(),
+          'duration': '0',
+        },
+      );
+
+      // an older server has no resumable upload API
+      if (session == null) {
+        return (handled: false, task: null);
+      }
+
+      // the server already has this file, so there is nothing to upload at all
+      if (session.duplicate != null) {
+        _logger.info("Server already has ${asset.id}; skipping upload");
+        return (handled: true, task: null);
+      }
+
+      final task = await buildChunkTask(
+        file,
+        uploadUrl: session.url!,
+        offset: 0,
+        total: total,
+        group: group,
+        metadata: UploadTaskMetadata.fromJson(
+          metadata,
+        ).copyWith(uploadUrl: session.url!.toString(), uploadOffset: 0, uploadTotal: total).toJson(),
+        deviceAssetId: asset.id,
+        priority: priority,
+        requiresWiFi: requiresWiFi,
+      );
+
+      return (handled: true, task: task);
+    } catch (error, stackTrace) {
+      // fall back to the single-request task rather than skipping the asset
+      _logger.warning("Could not start a resumable upload for ${asset.id}, using a single request", error, stackTrace);
+      return (handled: false, task: null);
+    }
+  }
+
+  /// One tus PATCH as a single native upload task.
+  ///
+  /// `background_downloader` consumes the `Range` header itself to upload only that slice of the
+  /// file and does not forward it to the server, so a chunked upload keeps all the OS-managed
+  /// background behaviour (iOS URLSession / Android WorkManager) that a whole-file task has.
+  Future<UploadTask> buildChunkTask(
+    File file, {
+    required Uri uploadUrl,
+    required int offset,
+    required int total,
+    required String group,
+    required String metadata,
+    String? deviceAssetId,
+    int? priority,
+    bool requiresWiFi = true,
+    int chunkSize = kUploadChunkSize,
+  }) async {
+    final (baseDirectory, directory, filename) = await Task.split(filePath: file.path);
+    final range = chunkRange(offset, total, chunkSize: chunkSize);
+
+    return UploadTask(
+      taskId: '${deviceAssetId ?? filename}#$offset',
+      displayName: filename,
+      httpRequestMethod: 'PATCH',
+      url: uploadUrl.toString(),
+      post: 'binary',
+      headers: {
+        ...ApiService.getRequestHeaders(),
+        // consumed by the plugin to slice the file; never sent to the server
+        'Range': rangeHeader(range.start, range.end),
+        'Tus-Resumable': kTusVersion,
+        'Upload-Offset': '$offset',
+        'Content-Type': kTusOffsetContentType,
+        // an empty value omits the header the plugin would otherwise add for binary uploads
+        'Content-Disposition': '',
+      },
+      filename: filename,
+      baseDirectory: baseDirectory,
+      directory: directory,
+      metaData: metadata,
+      group: group,
+      requiresWiFi: requiresWiFi,
+      priority: priority ?? 5,
+      updates: Updates.statusAndProgress,
+      retries: 3,
+    );
   }
 
   Future<UploadTask> buildUploadTask(

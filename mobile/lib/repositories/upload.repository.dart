@@ -162,6 +162,51 @@ class UploadRepository {
     }
   }
 
+  /// Create a tus upload session.
+  ///
+  /// Returns null when the server has no resumable upload API, so callers can fall back to the
+  /// single-request endpoint. Attempting the creation request is the capability probe: a dedicated
+  /// OPTIONS probe is answered by CORS middleware on dev servers before it reaches the route.
+  Future<ResumableSession?> createResumableSession({
+    required int size,
+    required String originalFileName,
+    required String checksum,
+    required Map<String, String> fields,
+    Completer<void>? cancelToken,
+    Client? httpClient,
+  }) async {
+    final endpoint = Store.get(StoreKey.serverEndpoint);
+    final client = httpClient ?? NetworkRepository.client;
+
+    final response = await _send(
+      client,
+      'POST',
+      Uri.parse('$endpoint/assets/upload'),
+      cancelToken: cancelToken,
+      headers: {
+        'Tus-Resumable': kTusVersion,
+        'Upload-Length': '$size',
+        'Upload-Metadata': encodeUploadMetadata({...fields, 'filename': originalFileName}),
+        'x-immich-checksum': checksum,
+      },
+    );
+
+    if (response.statusCode == HttpStatus.notFound || response.statusCode == HttpStatus.methodNotAllowed) {
+      return null;
+    }
+
+    if (response.statusCode == HttpStatus.ok) {
+      return ResumableSession(duplicate: _resultFrom(response, originalFileName));
+    }
+
+    final location = response.headers['location'];
+    if (response.statusCode != HttpStatus.created || location == null) {
+      throw StateError('Unable to start a resumable upload: ${response.statusCode}');
+    }
+
+    return ResumableSession(url: Uri.parse(endpoint).resolve(location));
+  }
+
   /// Upload a file in chunks over the tus API, resuming from the server's offset if a session for
   /// this file already exists.
   ///
@@ -179,43 +224,30 @@ class UploadRepository {
     Client? httpClient,
     int chunkSize = kUploadChunkSize,
   }) async {
-    final endpoint = Store.get(StoreKey.serverEndpoint);
     final client = httpClient ?? NetworkRepository.client;
     final total = file.lengthSync();
 
     try {
-      final create = await _send(
-        client,
-        'POST',
-        Uri.parse('$endpoint/assets/upload'),
+      final session = await createResumableSession(
+        size: total,
+        originalFileName: originalFileName,
+        checksum: checksum,
+        fields: fields,
         cancelToken: cancelToken,
-        headers: {
-          'Tus-Resumable': kTusVersion,
-          'Upload-Length': '$total',
-          'Upload-Metadata': encodeUploadMetadata({...fields, 'filename': originalFileName}),
-          'x-immich-checksum': checksum,
-        },
+        httpClient: client,
       );
 
       // an older server has no such route
-      if (create.statusCode == HttpStatus.notFound || create.statusCode == HttpStatus.methodNotAllowed) {
+      if (session == null) {
         return null;
       }
 
       // the server recognised the checksum, so there is nothing to upload
-      if (create.statusCode == HttpStatus.ok) {
-        return _resultFrom(create, logContext);
+      if (session.duplicate != null) {
+        return session.duplicate;
       }
 
-      final location = create.headers['location'];
-      if (create.statusCode != HttpStatus.created || location == null) {
-        return UploadResult.error(
-          statusCode: create.statusCode,
-          errorMessage: 'Unable to start a resumable upload: ${create.statusCode}',
-        );
-      }
-
-      final url = Uri.parse(endpoint).resolve(location);
+      final url = session.url!;
       var offset = 0;
 
       while (offset < total) {
@@ -312,6 +344,14 @@ class UploadRepository {
     logger.warning("Resumable upload $logContext failed: ${response.statusCode} $message");
     return UploadResult.error(statusCode: response.statusCode, errorMessage: message);
   }
+}
+
+/// Either a live session to upload into, or an asset the server already had.
+class ResumableSession {
+  final Uri? url;
+  final UploadResult? duplicate;
+
+  const ResumableSession({this.url, this.duplicate});
 }
 
 class AbortableRequest extends Request with Abortable {
