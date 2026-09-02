@@ -4,11 +4,13 @@ import {
   Delete,
   Head,
   HttpCode,
+  HttpException,
   HttpStatus,
   Options,
   Param,
   Patch,
   Post,
+  Put,
   Req,
   Res,
   UseInterceptors,
@@ -20,7 +22,7 @@ import { AuthDto } from 'src/dtos/auth.dto';
 import { ImmichHeader, Permission } from 'src/enum';
 import { AssetUploadInterceptor } from 'src/middleware/asset-upload.interceptor';
 import { Auth, Authenticated } from 'src/middleware/auth.guard';
-import { AssetUploadService, UploadOffsetConflict } from 'src/services/asset-upload.service';
+import { AssetUploadService, SIDECAR_MAX_SIZE, UploadOffsetConflict } from 'src/services/asset-upload.service';
 import { getHeader, parseNonNegativeInt, parseUploadMetadata, TUS_EXTENSIONS, TUS_VERSION } from 'src/utils/tus';
 
 /**
@@ -130,6 +132,18 @@ export class AssetUploadController {
     }
   }
 
+  /**
+   * Attach an XMP sidecar. A raw body rather than a second tus session: sidecars are a few KB, so
+   * they never hit the request-size limits that resumable uploads exist to work around, and
+   * Upload-Metadata is not an option (nginx's default header buffer is 8KB).
+   */
+  @Put(':id/sidecar')
+  @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async sidecar(@Auth() auth: AuthDto, @Param('id') id: string, @Req() req: Request) {
+    await this.service.putSidecar(auth, id, await readBody(req, SIDECAR_MAX_SIZE));
+  }
+
   @Delete(':id')
   @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
   @HttpCode(HttpStatus.NO_CONTENT)
@@ -138,3 +152,19 @@ export class AssetUploadController {
     res.set({ 'Tus-Resumable': TUS_VERSION });
   }
 }
+
+/** Read a small raw request body, refusing anything over the limit rather than buffering it. */
+const readBody = async (req: Request, limit: number) => {
+  const chunks: Buffer[] = [];
+  let size = 0;
+
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    size += chunk.length;
+    if (size > limit) {
+      throw new HttpException(`Body exceeds ${limit} bytes`, HttpStatus.PAYLOAD_TOO_LARGE);
+    }
+    chunks.push(chunk);
+  }
+
+  return Buffer.concat(chunks);
+};

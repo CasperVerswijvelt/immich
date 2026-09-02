@@ -9,7 +9,7 @@ import { AssetMediaStatus } from 'src/dtos/asset-media-response.dto';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { AssetMediaService } from 'src/services/asset-media.service';
-import { AssetUploadService, UploadOffsetConflict } from 'src/services/asset-upload.service';
+import { AssetUploadService, SIDECAR_MAX_SIZE, UploadOffsetConflict } from 'src/services/asset-upload.service';
 import { TusMetadata, UPLOAD_EXPIRY_MS } from 'src/utils/tus';
 import { AuthFactory } from 'test/factories/auth.factory';
 import { afterEach, beforeEach, describe, expect, it, Mocked, vitest } from 'vitest';
@@ -150,6 +150,7 @@ describe(AssetUploadService.name, () => {
           size: payload.length,
           checksum: Buffer.from(checksum, 'hex'),
         }),
+        undefined,
       );
       await expect(readdir(folder)).resolves.toEqual([`${id}.jpg`]);
     });
@@ -227,6 +228,53 @@ describe(AssetUploadService.name, () => {
 
       const result = await sut.patch(auth, id, 0, body(payload));
       expect(result.asset).toEqual({ id: 'existing', status: AssetMediaStatus.DUPLICATE });
+    });
+  });
+
+  describe('putSidecar', () => {
+    it('should attach the sidecar to the finished asset', async () => {
+      const { id } = await create();
+      await sut.putSidecar(auth, id, Buffer.from('<x:xmpmeta/>'));
+
+      await sut.patch(auth, id, 0, body(payload));
+
+      expect(assetMediaService.uploadAsset).toHaveBeenCalledWith(
+        auth,
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ originalPath: join(folder, `${id}.xmp`) }),
+      );
+      await expect(readFile(join(folder, `${id}.xmp`), 'utf8')).resolves.toBe('<x:xmpmeta/>');
+    });
+
+    it('should not pass a sidecar when none was uploaded', async () => {
+      const { id } = await create();
+
+      await sut.patch(auth, id, 0, body(payload));
+
+      expect(assetMediaService.uploadAsset).toHaveBeenCalledWith(auth, expect.anything(), expect.anything(), undefined);
+    });
+
+    it.each([Buffer.alloc(0), Buffer.alloc(SIDECAR_MAX_SIZE + 1)])(
+      'should reject a %o byte sidecar',
+      async (sidecar) => {
+        const { id } = await create();
+
+        await expect(sut.putSidecar(auth, id, sidecar)).rejects.toThrow(BadRequestException);
+      },
+    );
+
+    it('should not find an unknown upload', async () => {
+      await expect(sut.putSidecar(auth, 'nope', Buffer.from('x'))).rejects.toThrow(NotFoundException);
+    });
+
+    it('should remove the sidecar when the session is discarded', async () => {
+      const { id } = await create();
+      await sut.putSidecar(auth, id, Buffer.from('<x:xmpmeta/>'));
+
+      await sut.delete(auth, id);
+
+      await expect(readdir(folder)).resolves.toEqual([]);
     });
   });
 

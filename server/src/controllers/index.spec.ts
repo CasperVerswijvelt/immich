@@ -64,6 +64,7 @@ const SHARED_LINK_ROUTES = new Set([
   'PATCH assets/upload/:id',
   'POST assets',
   'POST assets/upload',
+  'PUT assets/upload/:id/sidecar',
   'POST download/archive',
   'POST download/info',
   'POST search/metadata',

@@ -129,7 +129,7 @@ starting over.
 Clients fall back to a single-request upload automatically when the server does not support this, so
 nothing breaks on an older server. For the chunked path to work, your reverse proxy must:
 
-- **Allow the `OPTIONS`, `HEAD`, `PATCH` and `DELETE` methods** on `/api/assets/upload/*`. Some WAF
+- **Allow the `OPTIONS`, `HEAD`, `PATCH`, `PUT` and `DELETE` methods** on `/api/assets/upload/*`. Some WAF
   rulesets and Apache `ProxyPass` configurations restrict methods to `GET`/`POST` by default.
 - **Forward the `Tus-Resumable`, `Upload-Offset`, `Upload-Length`, `Upload-Metadata` and
   `Upload-Expires` headers in both directions.** A proxy that strips unknown headers breaks

@@ -22,6 +22,7 @@ import { Stats, createReadStream, existsSync } from 'node:fs';
 import { stat, unlink } from 'node:fs/promises';
 import path, { basename } from 'node:path';
 import { Queue } from 'src/queue';
+import { resumableUpload, shouldUseResumableUpload } from 'src/resumable';
 import { BaseOptions, Batcher, authenticate, crawl, requirePermissions, s, sha1 } from 'src/utils';
 
 const UPLOAD_WATCH_BATCH_SIZE = 100;
@@ -67,8 +68,8 @@ class UploadFile extends File {
 }
 
 const uploadBatch = async (files: string[], options: UploadOptionsDto) => {
-  const { newFiles, duplicates } = await checkForDuplicates(files, options);
-  const newAssets = await uploadFiles(newFiles, options);
+  const { newFiles, duplicates, checksums } = await checkForDuplicates(files, options);
+  const newAssets = await uploadFiles(newFiles, options, checksums);
   if (options.jsonOutput) {
     console.log(JSON.stringify({ newFiles, duplicates, newAssets }, undefined, 4));
   }
@@ -179,7 +180,7 @@ const scan = async (pathsToCrawl: string[], options: UploadOptionsDto) => {
 export const checkForDuplicates = async (files: string[], { concurrency, skipHash, progress }: UploadOptionsDto) => {
   if (skipHash) {
     console.log('Skipping hash check, assuming all files are new');
-    return { newFiles: files, duplicates: [] };
+    return { newFiles: files, duplicates: [], checksums: new Map<string, string>() };
   }
 
   let multiBar: MultiBar | undefined;
@@ -306,10 +307,14 @@ export const checkForDuplicates = async (files: string[], { concurrency, skipHas
     }
   }
 
-  return { newFiles, duplicates };
+  return { newFiles, duplicates, checksums: new Map(results.map(({ id, checksum }) => [id, checksum])) };
 };
 
-export const uploadFiles = async (files: string[], options: UploadOptionsDto): Promise<Asset[]> => {
+export const uploadFiles = async (
+  files: string[],
+  options: UploadOptionsDto,
+  checksums: Map<string, string> = new Map(),
+): Promise<Asset[]> => {
   const { dryRun, concurrency, progress } = options;
   if (files.length === 0) {
     console.log('All assets were already uploaded, nothing to do.');
@@ -359,7 +364,7 @@ export const uploadFiles = async (files: string[], options: UploadOptionsDto): P
         throw new Error(`Stats not found for ${filepath}`);
       }
 
-      const response = await uploadFile(filepath, stats, options);
+      const response = await uploadFile(filepath, stats, options, checksums.get(filepath));
       newAssets.push({ id: response.id, filepath });
       if (response.status === AssetMediaStatus.Duplicate) {
         duplicateCount++;
@@ -405,8 +410,38 @@ const uploadFile = async (
   input: string,
   stats: Stats,
   { visibility }: UploadOptionsDto,
+  checksum?: string,
 ): Promise<AssetMediaResponseDto> => {
   const { baseUrl, headers } = defaults;
+
+  const sidecarPath = findSidecar(input);
+
+  // Chunked upload for large files, so a reverse proxy with a request-body cap does not block them
+  // and a dropped connection does not cost the whole transfer. Needs the checksum computed during
+  // the duplicate check, so `--skip-hash` keeps using the single-request endpoint. Sidecars are
+  // sent alongside the session, and the server attaches them when the upload completes.
+  if (checksum && shouldUseResumableUpload(stats.size)) {
+    const response = await resumableUpload({
+      baseUrl,
+      headers: headers as Record<string, string>,
+      filepath: input,
+      size: stats.size,
+      filename: basename(input),
+      checksum,
+      metadata: {
+        fileCreatedAt: stats.mtime.toISOString(),
+        fileModifiedAt: stats.mtime.toISOString(),
+        isFavorite: 'false',
+        visibility,
+      },
+      sidecarPath,
+    });
+
+    // undefined means the server has no resumable upload API; fall through to multipart
+    if (response) {
+      return response as AssetMediaResponseDto;
+    }
+  }
 
   const formData = new FormData();
   formData.append('fileCreatedAt', stats.mtime.toISOString());
@@ -418,7 +453,6 @@ const uploadFile = async (
     formData.append('visibility', visibility);
   }
 
-  const sidecarPath = findSidecar(input);
   if (sidecarPath) {
     try {
       const stats = await stat(sidecarPath);
