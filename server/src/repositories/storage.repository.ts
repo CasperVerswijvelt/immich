@@ -79,6 +79,11 @@ export class StorageRepository {
     return createWriteStream(filepath, { flags: 'w', flush: true });
   }
 
+  /** Append to an existing file at a byte offset. Used by resumable (tus) uploads. */
+  createAppendStream(filepath: string, start: number): Writable {
+    return createWriteStream(filepath, { flags: 'r+', start, flush: true });
+  }
+
   createOrOverwriteFile(filepath: string, buffer: Buffer) {
     return fs.writeFile(filepath, buffer, { flag: 'w' });
   }
