@@ -13,13 +13,14 @@ files and fall back to it whenever the resumable endpoints are unavailable.
 All endpoints require the `asset.upload` permission and accept shared-link authentication via the
 usual `key`/`slug` query parameters.
 
-| Method    | Path                      | Purpose                                |
-| --------- | ------------------------- | -------------------------------------- |
-| `OPTIONS` | `/api/assets/upload`      | Protocol discovery                     |
-| `POST`    | `/api/assets/upload`      | Create an upload session               |
-| `HEAD`    | `/api/assets/upload/{id}` | Current offset, for resuming           |
-| `PATCH`   | `/api/assets/upload/{id}` | Append bytes at an offset              |
-| `DELETE`  | `/api/assets/upload/{id}` | Abandon a session and delete its bytes |
+| Method    | Path                              | Purpose                                |
+| --------- | --------------------------------- | -------------------------------------- |
+| `OPTIONS` | `/api/assets/upload`              | Protocol discovery                     |
+| `POST`    | `/api/assets/upload`              | Create an upload session               |
+| `HEAD`    | `/api/assets/upload/{id}`         | Current offset, for resuming           |
+| `PATCH`   | `/api/assets/upload/{id}`         | Append bytes at an offset              |
+| `PUT`     | `/api/assets/upload/{id}/sidecar` | Attach an XMP sidecar                  |
+| `DELETE`  | `/api/assets/upload/{id}`         | Abandon a session and delete its bytes |
 
 Supported extensions: `creation`, `expiration`, `termination`. Sessions expire after 7 days.
 
@@ -115,6 +116,24 @@ Two failure modes are specific to completion:
 Once the upload completes, the asset enters the same pipeline as a single-request upload: metadata
 extraction, storage template migration, thumbnail generation, and so on.
 
+### Sidecars
+
+```http
+PUT /api/assets/upload/{id}/sidecar
+Tus-Resumable: 1.0.0
+Content-Type: application/xml
+
+<x:xmpmeta>...</x:xmpmeta>
+```
+
+XMP sidecars are a few kilobytes, so they are sent in a single request rather than getting a
+resumable session of their own - they never approach the request-size limits this API exists to work
+around. Send it any time before the upload completes; the server attaches it to the asset at
+completion. The body must be between 1 byte and 1 MB, otherwise the request is rejected.
+
+`Upload-Metadata` is not an option for this: nginx's default header buffer is 8 KB, well below a
+typical sidecar.
+
 ### Resuming
 
 ```http
@@ -141,6 +160,7 @@ file's SHA-1 works well, since the checksum is needed to create the session anyw
   otherwise make a progress bar jump backwards.
 - **`DELETE` the session when a user cancels**, otherwise the partial file occupies disk until it
   expires.
+- **Send a sidecar before the final chunk.** Right after creating the session is simplest.
 
 ## Server implementation
 
@@ -149,6 +169,7 @@ Session state lives entirely on the filesystem, next to where single-request upl
 ```
 <media>/upload/<userId>/ab/cd/<uuid>.<ext>.part   the bytes; the offset is this file's size
 <media>/upload/<userId>/ab/cd/<uuid>.json         session metadata
+<media>/upload/<userId>/ab/cd/<uuid>.xmp          sidecar, if one was attached
 ```
 
 Using the file's size as the offset is what makes an interrupted `PATCH` safe: there is no separate

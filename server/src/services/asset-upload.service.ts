@@ -3,7 +3,7 @@ import AsyncLock from 'async-lock';
 import { Request } from 'express';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { finished, pipeline } from 'node:stream/promises';
 import { AssetMediaResponseDto } from 'src/dtos/asset-media-response.dto';
 import { AssetMediaCreateDto, UploadFieldName } from 'src/dtos/asset-media.dto';
@@ -18,6 +18,9 @@ import { PART_SUFFIX, TusMetadata, UPLOAD_EXPIRY_MS, validateOffset } from 'src/
 
 /** Status code from the tus checksum extension, reused here for the whole-file digest. */
 const CHECKSUM_MISMATCH = 460;
+
+/** XMP sidecars are metadata, not media. Anything near this size is not a sidecar. */
+export const SIDECAR_MAX_SIZE = 1024 * 1024;
 
 interface UploadSession {
   uploadLength: number;
@@ -165,6 +168,19 @@ export class AssetUploadService {
   }
 
   /**
+   * Attach an XMP sidecar to a session. Sidecars are a few KB, so they are written in one request
+   * rather than getting a resumable session of their own; finalize picks the file up if present.
+   */
+  async putSidecar(auth: AuthDto, id: string, sidecar: Buffer) {
+    const { partPath } = await this.getState(auth, id);
+    if (sidecar.length === 0 || sidecar.length > SIDECAR_MAX_SIZE) {
+      throw new BadRequestException(`Sidecar must be between 1 and ${SIDECAR_MAX_SIZE} bytes`);
+    }
+
+    await this.storageRepository.createOrOverwriteFile(sidecarPathFor(partPath), sidecar);
+  }
+
+  /**
    * Pump the request body onto the end of the part file.
    *
    * Deliberately not `stream.pipeline`: when the source errors, pipeline *destroys* the
@@ -222,14 +238,24 @@ export class AssetUploadService {
     const originalPath = partPath.slice(0, -PART_SUFFIX.length);
     await this.storageRepository.rename(partPath, originalPath);
 
+    const sidecarPath = sidecarPathFor(partPath);
+    const sidecar = (await this.storageRepository.checkFileExists(sidecarPath))
+      ? { uuid: uuidOf(originalPath), checksum, originalPath: sidecarPath, originalName: '', size: 0 }
+      : undefined;
+
     try {
-      return await this.assetMediaService.uploadAsset(auth, parsed.data, {
-        uuid: uuidOf(originalPath),
-        checksum,
-        originalPath,
-        originalName: parsed.data.filename ?? session.metadata.filename,
-        size: session.uploadLength,
-      });
+      return await this.assetMediaService.uploadAsset(
+        auth,
+        parsed.data,
+        {
+          uuid: uuidOf(originalPath),
+          checksum,
+          originalPath,
+          originalName: parsed.data.filename ?? session.metadata.filename,
+          size: session.uploadLength,
+        },
+        sidecar,
+      );
     } finally {
       await this.storageRepository.unlink(jsonPath);
     }
@@ -242,7 +268,18 @@ export class AssetUploadService {
   }
 
   private async discard(partPath: string, jsonPath: string) {
-    await Promise.all([this.storageRepository.unlink(partPath), this.storageRepository.unlink(jsonPath)]);
+    const sidecarPath = sidecarPathFor(partPath);
+    await Promise.all([
+      this.storageRepository.unlink(partPath),
+      this.storageRepository.unlink(jsonPath),
+      this.unlinkIfExists(sidecarPath),
+    ]);
+  }
+
+  private async unlinkIfExists(filepath: string) {
+    if (await this.storageRepository.checkFileExists(filepath)) {
+      await this.storageRepository.unlink(filepath);
+    }
   }
 
   /**
@@ -291,3 +328,12 @@ export class AssetUploadService {
 }
 
 const uuidOf = (filepath: string) => (filepath.split('/').pop() ?? filepath).replace(/\.[^.]*$/, '');
+
+/**
+ * `<uuid>.xmp` beside the media file, matching what getUploadFilename produces for the multipart
+ * endpoint - and what the storage template migration expects to move alongside the asset.
+ */
+const sidecarPathFor = (partPath: string) => {
+  const originalPath = partPath.slice(0, -PART_SUFFIX.length);
+  return join(dirname(originalPath), `${uuidOf(originalPath)}.xmp`);
+};

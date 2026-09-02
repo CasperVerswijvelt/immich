@@ -181,6 +181,7 @@ describe('checkForDuplicates', () => {
         },
       ],
       newFiles: [],
+      checksums: new Map([[testFilePath, testFileChecksum]]),
     });
   });
 
@@ -197,6 +198,7 @@ describe('checkForDuplicates', () => {
     await expect(checkForDuplicates([testFilePath], { concurrency: 1 })).resolves.toEqual({
       duplicates: [],
       newFiles: [testFilePath],
+      checksums: new Map([[testFilePath, testFileChecksum]]),
     });
   });
 
@@ -217,6 +219,7 @@ describe('checkForDuplicates', () => {
     await expect(checkForDuplicates([testFilePath], { concurrency: 1 })).resolves.toEqual({
       duplicates: [],
       newFiles: [testFilePath],
+      checksums: new Map([[testFilePath, testFileChecksum]]),
     });
   });
 
@@ -226,6 +229,7 @@ describe('checkForDuplicates', () => {
     await expect(checkForDuplicates([testFilePath], { concurrency: 1 })).resolves.toEqual({
       duplicates: [],
       newFiles: [],
+      checksums: new Map([[testFilePath, testFileChecksum]]),
     });
   });
 });
