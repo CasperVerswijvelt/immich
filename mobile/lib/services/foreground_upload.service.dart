@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:immich_mobile/domain/models/asset/asset_metadata.model.dart';
@@ -19,6 +20,7 @@ import 'package:immich_mobile/providers/infrastructure/platform.provider.dart';
 import 'package:immich_mobile/providers/infrastructure/storage.provider.dart';
 import 'package:immich_mobile/repositories/asset_media.repository.dart';
 import 'package:immich_mobile/repositories/upload.repository.dart';
+import 'package:immich_mobile/utils/tus.dart';
 import 'package:logging/logging.dart';
 import 'package:openapi/api.dart';
 import 'package:path/path.dart' as p;
@@ -369,9 +371,10 @@ class ForegroundUploadService {
       }
 
       final onProgress = callbacks.onProgress;
-      final result = await _uploadRepository.uploadFile(
+      final result = await _upload(
         file: file,
         originalFileName: originalFileName,
+        checksum: asset.checksum,
         fields: fields,
         cancelToken: cancelToken,
         onProgress: onProgress != null
@@ -434,9 +437,11 @@ class ForegroundUploadService {
         'duration': '0',
       };
 
-      return await _uploadRepository.uploadFile(
+      return await _upload(
         file: file,
         originalFileName: filename,
+        // shared files have no precomputed hash; only worth the extra read for large ones
+        checksum: shouldUseResumableUpload(stats.size) ? await _sha1(file) : null,
         fields: fields,
         cancelToken: cancelToken,
         onProgress: onProgress,
@@ -445,6 +450,51 @@ class ForegroundUploadService {
     } catch (e) {
       return UploadResult.error(errorMessage: e.toString());
     }
+  }
+
+  /// Chunked upload for large files, falling back to a single request when the file is small, the
+  /// checksum is unknown, or the server has no resumable API.
+  Future<UploadResult> _upload({
+    required File file,
+    required String originalFileName,
+    required String? checksum,
+    required Map<String, String> fields,
+    required Completer<void>? cancelToken,
+    required String logContext,
+    void Function(int bytes, int totalBytes)? onProgress,
+  }) async {
+    if (checksum != null && shouldUseResumableUpload(await file.length())) {
+      final result = await _uploadRepository.uploadFileResumable(
+        file: file,
+        originalFileName: originalFileName,
+        checksum: checksum,
+        fields: fields,
+        cancelToken: cancelToken,
+        onProgress: onProgress,
+        logContext: logContext,
+      );
+
+      if (result != null) {
+        return result;
+      }
+
+      _logger.info("Server has no resumable upload API; falling back for $logContext");
+    }
+
+    return _uploadRepository.uploadFile(
+      file: file,
+      originalFileName: originalFileName,
+      fields: fields,
+      cancelToken: cancelToken,
+      onProgress: onProgress,
+      logContext: logContext,
+    );
+  }
+
+  /// Base64 sha1, matching the format the native hasher stores on LocalAsset.
+  Future<String> _sha1(File file) async {
+    final digest = await file.openRead().transform(sha1).first;
+    return base64.encode(digest.bytes);
   }
 
   bool _shouldRequireWiFi(LocalAsset asset) {
