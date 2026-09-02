@@ -124,4 +124,161 @@ void main() {
     expect(result.errorMessage, 'boom');
     verify(() => client.send(any())).called(1);
   });
+
+  group('uploadFileResumable', () {
+    late File large;
+
+    setUpAll(() {
+      large = File('${Directory.systemTemp.createTempSync().path}/video.mp4')
+        ..writeAsBytesSync(List.filled(1000, 0x41));
+    });
+
+    /// Records each request so the offsets actually put on the wire can be asserted.
+    List<http.BaseRequest> stubExchanges(List<http.StreamedResponse> Function() replies) {
+      final sent = <http.BaseRequest>[];
+      final queue = replies();
+      var index = 0;
+      when(() => client.send(any())).thenAnswer((invocation) async {
+        final request = invocation.positionalArguments.single as http.BaseRequest;
+        await request.finalize().drain<void>();
+        sent.add(request);
+        return queue[index++];
+      });
+      return sent;
+    }
+
+    http.StreamedResponse headerResponse(int status, Map<String, String> headers) =>
+        http.StreamedResponse(const Stream<List<int>>.empty(), status, headers: headers);
+
+    Future<UploadResult?> resumable({int chunkSize = 400}) => sut.uploadFileResumable(
+      file: large,
+      originalFileName: 'video.mp4',
+      checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=',
+      fields: const {'fileCreatedAt': '2026-01-01T00:00:00.000Z'},
+      cancelToken: null,
+      logContext: 'a1',
+      httpClient: client,
+      chunkSize: chunkSize,
+    );
+
+    test('creates a session then PATCHes sequential offsets', () async {
+      final sent = stubExchanges(
+        () => [
+          headerResponse(201, {'location': '/api/assets/upload/abc'}),
+          headerResponse(204, {'upload-offset': '400'}),
+          headerResponse(204, {'upload-offset': '800'}),
+          response(201, '{"id":"asset-id","status":"created"}'),
+        ],
+      );
+
+      final result = await resumable();
+
+      expect(result?.isSuccess, isTrue);
+      expect(result?.remoteAssetId, 'asset-id');
+      expect(sent.map((request) => request.method), ['POST', 'PATCH', 'PATCH', 'PATCH']);
+      expect(sent.first.headers['Upload-Length'], '1000');
+      expect(sent.first.headers['x-immich-checksum'], 'Ki3hxnotKPzthJ7hu3bnORuT6xI=');
+      expect(sent.first.headers['Upload-Metadata'], contains('filename ${base64.encode(utf8.encode('video.mp4'))}'));
+      expect(sent.skip(1).map((request) => request.headers['Upload-Offset']), ['0', '400', '800']);
+      expect(sent[1].headers['Content-Type'], 'application/offset+octet-stream');
+      expect(sent.last.url.toString(), 'http://demo.immich.app/api/assets/upload/abc');
+    });
+
+    test('returns null so the caller can fall back when the route is missing', () async {
+      stubExchanges(() => [headerResponse(404, {})]);
+
+      expect(await resumable(), null);
+    });
+
+    test('skips the upload when the server already has the checksum', () async {
+      final sent = stubExchanges(() => [response(200, '{"id":"existing","status":"duplicate"}')]);
+
+      final result = await resumable();
+
+      expect(result?.remoteAssetId, 'existing');
+      expect(sent, hasLength(1));
+    });
+
+    test('adopts the offset a 409 reports', () async {
+      final sent = stubExchanges(
+        () => [
+          headerResponse(201, {'location': '/api/assets/upload/abc'}),
+          headerResponse(409, {'upload-offset': '600'}),
+          response(201, '{"id":"asset-id","status":"created"}'),
+        ],
+      );
+
+      final result = await resumable();
+
+      expect(result?.isSuccess, isTrue);
+      expect(sent.last.headers['Upload-Offset'], '600');
+      expect(sent.last.contentLength, 400);
+    });
+
+    test('gives up rather than looping when a 409 repeats the same offset', () async {
+      stubExchanges(
+        () => [
+          headerResponse(201, {'location': '/api/assets/upload/abc'}),
+          headerResponse(409, {'upload-offset': '0'}),
+        ],
+      );
+
+      final result = await resumable();
+
+      expect(result?.isSuccess, isFalse);
+      expect(result?.errorMessage, contains('did not advance'));
+    });
+
+    test('reports whole-file progress that never regresses', () async {
+      stubExchanges(
+        () => [
+          headerResponse(201, {'location': '/api/assets/upload/abc'}),
+          headerResponse(204, {'upload-offset': '400'}),
+          headerResponse(204, {'upload-offset': '800'}),
+          response(201, '{"id":"asset-id","status":"created"}'),
+        ],
+      );
+
+      final seen = <int>[];
+      await sut.uploadFileResumable(
+        file: large,
+        originalFileName: 'video.mp4',
+        checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=',
+        fields: const {},
+        cancelToken: null,
+        logContext: 'a1',
+        httpClient: client,
+        chunkSize: 400,
+        onProgress: (bytes, total) {
+          expect(total, 1000);
+          seen.add(bytes);
+        },
+      );
+
+      expect(seen, [400, 800, 1000]);
+      expect(seen, orderedEquals(List.of(seen)..sort()));
+    });
+
+    test('surfaces a 413 with a readable message', () async {
+      stubExchanges(
+        () => [
+          headerResponse(201, {'location': '/api/assets/upload/abc'}),
+          response(413, ''),
+        ],
+      );
+
+      final result = await resumable();
+
+      expect(result?.statusCode, 413);
+      expect(result?.errorMessage, contains('too large'));
+    });
+
+    test('a cancel before the session is created counts as cancelled', () async {
+      when(() => client.send(any())).thenThrow(http.RequestAbortedException());
+
+      final result = await resumable();
+
+      expect(result?.isCancelled, isTrue);
+    });
+  });
 }

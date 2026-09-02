@@ -2,7 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:background_downloader/background_downloader.dart';
+// `Request` collides with http's; only http's is used here.
+import 'package:background_downloader/background_downloader.dart' hide Request;
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart';
 import 'package:immich_mobile/constants/constants.dart';
@@ -10,6 +11,7 @@ import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
 import 'package:immich_mobile/infrastructure/repositories/network.repository.dart';
 import 'package:immich_mobile/utils/debug_print.dart';
+import 'package:immich_mobile/utils/tus.dart';
 import 'package:logging/logging.dart';
 
 final uploadRepositoryProvider = Provider((ref) => UploadRepository());
@@ -159,6 +161,164 @@ class UploadRepository {
       return UploadResult.error(errorMessage: error.toString());
     }
   }
+
+  /// Upload a file in chunks over the tus API, resuming from the server's offset if a session for
+  /// this file already exists.
+  ///
+  /// Returns null when the server has no resumable upload API, so the caller can fall back to
+  /// [uploadFile]. Attempting the creation request is the capability probe: a dedicated OPTIONS
+  /// probe is answered by CORS middleware on dev servers before it reaches the route.
+  Future<UploadResult?> uploadFileResumable({
+    required File file,
+    required String originalFileName,
+    required String checksum,
+    required Map<String, String> fields,
+    required Completer<void>? cancelToken,
+    void Function(int bytes, int totalBytes)? onProgress,
+    required String logContext,
+    Client? httpClient,
+    int chunkSize = kUploadChunkSize,
+  }) async {
+    final endpoint = Store.get(StoreKey.serverEndpoint);
+    final client = httpClient ?? NetworkRepository.client;
+    final total = file.lengthSync();
+
+    try {
+      final create = await _send(
+        client,
+        'POST',
+        Uri.parse('$endpoint/assets/upload'),
+        cancelToken: cancelToken,
+        headers: {
+          'Tus-Resumable': kTusVersion,
+          'Upload-Length': '$total',
+          'Upload-Metadata': encodeUploadMetadata({...fields, 'filename': originalFileName}),
+          'x-immich-checksum': checksum,
+        },
+      );
+
+      // an older server has no such route
+      if (create.statusCode == HttpStatus.notFound || create.statusCode == HttpStatus.methodNotAllowed) {
+        return null;
+      }
+
+      // the server recognised the checksum, so there is nothing to upload
+      if (create.statusCode == HttpStatus.ok) {
+        return _resultFrom(create, logContext);
+      }
+
+      final location = create.headers['location'];
+      if (create.statusCode != HttpStatus.created || location == null) {
+        return UploadResult.error(
+          statusCode: create.statusCode,
+          errorMessage: 'Unable to start a resumable upload: ${create.statusCode}',
+        );
+      }
+
+      final url = Uri.parse(endpoint).resolve(location);
+      var offset = 0;
+
+      while (offset < total) {
+        if (cancelToken?.isCompleted ?? false) {
+          return UploadResult.cancelled();
+        }
+
+        final range = chunkRange(offset, total, chunkSize: chunkSize);
+        final response = await _send(
+          client,
+          'PATCH',
+          url,
+          cancelToken: cancelToken,
+          headers: {'Tus-Resumable': kTusVersion, 'Upload-Offset': '$offset', 'Content-Type': kTusOffsetContentType},
+          body: await file.openRead(range.start, range.end).expand((chunk) => chunk).toList(),
+        );
+
+        // the server is the authority on the offset; a 409 carries the real one so we can resume
+        if (response.statusCode == HttpStatus.conflict) {
+          final authoritative = parseUploadOffset(response.headers);
+          if (authoritative == null || authoritative == offset) {
+            return UploadResult.error(errorMessage: 'Resumable upload stalled: server offset did not advance');
+          }
+          offset = authoritative;
+          continue;
+        }
+
+        if (response.statusCode == HttpStatus.ok || response.statusCode == HttpStatus.created) {
+          onProgress?.call(total, total);
+          return _resultFrom(response, logContext);
+        }
+
+        if (response.statusCode != HttpStatus.noContent) {
+          return _errorFrom(response, logContext);
+        }
+
+        offset = parseUploadOffset(response.headers) ?? range.end;
+        onProgress?.call(offset, total);
+      }
+
+      return UploadResult.error(errorMessage: 'Resumable upload finished without a response from the server');
+    } on RequestAbortedException {
+      logger.warning("Resumable upload $logContext was cancelled");
+      return UploadResult.cancelled();
+    } catch (error, stackTrace) {
+      logger.warning("Error uploading $logContext: $error: $stackTrace");
+      return UploadResult.error(errorMessage: error.toString());
+    }
+  }
+
+  Future<Response> _send(
+    Client client,
+    String method,
+    Uri url, {
+    required Map<String, String> headers,
+    required Completer<void>? cancelToken,
+    List<int>? body,
+  }) async {
+    final request = AbortableRequest(method, url, abortTrigger: cancelToken?.future);
+    request.headers.addAll(headers);
+    if (body != null) {
+      request.bodyBytes = body;
+    }
+
+    return Response.fromStream(await client.send(request));
+  }
+
+  UploadResult _resultFrom(Response response, String logContext) {
+    try {
+      final body = jsonDecode(response.body);
+      return UploadResult.success(remoteAssetId: body['id'] as String);
+    } catch (_) {
+      logger.warning("Unparseable response for $logContext: ${response.body}");
+      return UploadResult.error(errorMessage: 'Failed to parse server response');
+    }
+  }
+
+  UploadResult _errorFrom(Response response, String logContext) {
+    if (response.statusCode == HttpStatus.requestEntityTooLarge) {
+      return UploadResult.error(
+        statusCode: response.statusCode,
+        errorMessage: 'Error(413) File is too large to upload',
+      );
+    }
+
+    String? message;
+    try {
+      final error = jsonDecode(response.body);
+      message = error['message'] ?? error['error'];
+    } catch (_) {
+      message = response.body.isNotEmpty ? response.body : 'Upload failed with status ${response.statusCode}';
+    }
+
+    logger.warning("Resumable upload $logContext failed: ${response.statusCode} $message");
+    return UploadResult.error(statusCode: response.statusCode, errorMessage: message);
+  }
+}
+
+class AbortableRequest extends Request with Abortable {
+  AbortableRequest(super.method, super.url, {this.abortTrigger});
+
+  @override
+  final Future<void>? abortTrigger;
 }
 
 class ProgressMultipartRequest extends MultipartRequest with Abortable {
