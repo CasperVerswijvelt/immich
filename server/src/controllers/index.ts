@@ -4,6 +4,7 @@ import { ApiKeyController } from 'src/controllers/api-key.controller';
 import { AppController } from 'src/controllers/app.controller';
 import { AssetFilesController } from 'src/controllers/asset-file.controller';
 import { AssetMediaController } from 'src/controllers/asset-media.controller';
+import { AssetUploadController } from 'src/controllers/asset-upload.controller';
 import { AssetController } from 'src/controllers/asset.controller';
 import { AuthAdminController } from 'src/controllers/auth-admin.controller';
 import { AuthController } from 'src/controllers/auth.controller';
@@ -46,6 +47,8 @@ import { ViewController } from 'src/controllers/view.controller';
 import { WorkflowController } from 'src/controllers/workflow.controller';
 
 export const controllers = [
+  // must precede AssetController/AssetMediaController so `assets/upload/:id` wins over `assets/:id`
+  AssetUploadController,
   ApiKeyController,
   ActivityController,
   AlbumController,

@@ -4,6 +4,7 @@ import { ApiKeyService } from 'src/services/api-key.service';
 import { ApiService } from 'src/services/api.service';
 import { AssetFileService } from 'src/services/asset-file.service';
 import { AssetMediaService } from 'src/services/asset-media.service';
+import { AssetUploadService } from 'src/services/asset-upload.service';
 import { AssetService } from 'src/services/asset.service';
 import { AuthAdminService } from 'src/services/auth-admin.service';
 import { AuthService } from 'src/services/auth.service';
@@ -59,6 +60,7 @@ export const services = [
   ApiService,
   AssetFileService,
   AssetMediaService,
+  AssetUploadService,
   AssetService,
   AuthService,
   AuthAdminService,
