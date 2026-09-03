@@ -1,7 +1,8 @@
-# Builds the resumable-upload server image natively on amd64 and pushes it to this
-# fork's GHCR namespace. Deliberately separate from upstream's docker.yml so a rebase
-# onto a newer release never conflicts here.
-name: resumable server image
+# Builds the resumable-upload artifacts: the amd64 server image (pushed to this fork's
+# GHCR namespace) and a sideloadable Android APK. Deliberately separate from upstream's
+# docker.yml / build-mobile.yml so a rebase onto a newer release never conflicts here --
+# and because upstream's mobile workflow requires ten signing secrets this fork lacks.
+name: resumable artifacts
 
 on:
   # push-triggered because workflow_dispatch only resolves for files on the default branch,
@@ -52,3 +53,44 @@ jobs:
             BUILD_SOURCE_COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # pubspec pins `flutter: 3.44.8` exactly -- a newer SDK is rejected by pub, not warned about.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.8
+          cache: true
+
+      - run: flutter pub get
+        working-directory: mobile
+
+      - run: dart run build_runner build --delete-conflicting-outputs
+        working-directory: mobile
+
+      # Without these two the build dies with hundreds of
+      # "The getter 't' isn't defined for the type 'BuildContext'".
+      - run: dart run easy_localization:generate -S ../i18n
+        working-directory: mobile
+
+      - run: dart run bin/generate_keys.dart
+        working-directory: mobile
+
+      # No keystore in this fork, so build.gradle falls back to debug signing.
+      # Fine for sideloading; not publishable to Play.
+      - run: flutter build apk --release --target-platform android-arm64
+        working-directory: mobile
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: immich-apk-${{ inputs.tag || '3.1.0-resumable.1' }}-arm64
+          path: mobile/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
