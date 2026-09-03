@@ -59,6 +59,8 @@ void main() {
             );
 
             request.response.statusCode = HttpStatus.noContent;
+            // deliberately capitalised: parseUploadOffset looks up a lowercase key, so this is
+            // what proves the plugin lowercases response headers as assumed
             request.response.headers.set('Upload-Offset', '${body.length}');
             await request.response.close();
           })
@@ -75,23 +77,18 @@ void main() {
   Future<File> fixture(int size) async {
     final file = File('${Directory.systemTemp.path}/range-fixture-$size.bin');
     await file.writeAsBytes(List.generate(size, (i) => i % 251), flush: true);
+    addTearDown(() {
+      if (file.existsSync()) {
+        file.deleteSync();
+      }
+    });
     return file;
   }
 
-  Future<void> enqueueAndSettle(UploadTask task) async {
-    final done = Completer<TaskStatusUpdate>();
-    final result = await FileDownloader().upload(
-      task,
-      onStatus: (status) {
-        if (status.isFinalState && !done.isCompleted) {
-          done.complete(TaskStatusUpdate(task, status));
-        }
-      },
-    );
+  Future<TaskStatusUpdate> enqueueAndSettle(UploadTask task) async {
+    final result = await FileDownloader().upload(task);
     expect(result.status, TaskStatus.complete, reason: 'upload task did not complete: ${result.exception}');
-    if (!done.isCompleted) {
-      await done.future.timeout(const Duration(seconds: 30));
-    }
+    return result;
   }
 
   testWidgets('uploads only the requested byte range, and does not forward Range', (_) async {
@@ -101,7 +98,7 @@ void main() {
     final file = await fixture(total);
     final (baseDirectory, directory, filename) = await Task.split(filePath: file.path);
 
-    await enqueueAndSettle(
+    final update = await enqueueAndSettle(
       UploadTask(
         url: '$endpoint/api/assets/upload/abc',
         httpRequestMethod: 'PATCH',
@@ -140,6 +137,14 @@ void main() {
       List.generate(end - start, (i) => (start + i) % 251),
       reason: 'the uploaded bytes should be the slice at the requested offset',
     );
+
+    // the background chain reads the next offset out of these headers, so the lowercase lookup
+    // parseUploadOffset performs has to match what the plugin actually surfaces
+    expect(
+      parseUploadOffset(update.responseHeaders),
+      end - start,
+      reason: 'response headers must reach Dart lowercased',
+    );
   });
 
   testWidgets('an open-ended range uploads to the end of the file', (_) async {
@@ -177,7 +182,7 @@ void main() {
     var index = 0;
     while (offset < total) {
       final range = chunkRange(offset, total, chunkSize: chunkSize);
-      await enqueueAndSettle(
+      final update = await enqueueAndSettle(
         UploadTask(
           taskId: 'chunk-$index',
           url: '$endpoint/api/assets/upload/chained',
@@ -195,8 +200,8 @@ void main() {
         ),
       );
 
-      // the server is the authority on the next offset, exactly as the service treats it
-      offset = parseUploadOffset({'upload-offset': '${range.end}'})!;
+      // the server is the authority on the next offset, read from the real response
+      offset = parseUploadOffset(update.responseHeaders) ?? range.end;
       index++;
     }
 

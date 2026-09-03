@@ -2,7 +2,7 @@ import { BadRequestException, HttpException, NotFoundException } from '@nestjs/c
 import { Request } from 'express';
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, rm, utimes } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -180,6 +180,18 @@ describe(AssetUploadService.name, () => {
 
     it('should not find an unknown upload', async () => {
       await expect(sut.getState(auth, 'nope')).rejects.toThrow(NotFoundException);
+    });
+
+    it('should not find a session past its advertised expiry', async () => {
+      // Upload-Expires is advertised on every HEAD, so it has to actually be honoured
+      const { id } = await create();
+      const session = join(sessionDir(id), `${id}.json`);
+      const stored = JSON.parse(await readFile(session, 'utf8'));
+      await writeFile(session, JSON.stringify({ ...stored, expiresAt: new Date(Date.now() - 1000).toISOString() }));
+
+      await expect(sut.getState(auth, id)).rejects.toThrow(NotFoundException);
+      // and its bytes are reclaimed rather than waiting for the sweep
+      await expect(readdir(sessionDir(id))).resolves.toEqual([]);
     });
   });
 

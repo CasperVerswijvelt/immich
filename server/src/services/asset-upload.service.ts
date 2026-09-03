@@ -140,6 +140,15 @@ export class AssetUploadService {
 
       const partPath = join(folder, part);
       const session = await this.storageRepository.readJsonFile<UploadSession>(jsonPath);
+
+      // Upload-Expires is advertised on creation and on every HEAD, so honour it rather than
+      // letting a session stay writable until the sweep happens to collect it
+      if (Date.parse(session.expiresAt) <= Date.now()) {
+        this.logger.debug(`Resumable upload ${id} has expired`);
+        await this.discard(partPath, jsonPath);
+        throw new NotFoundException();
+      }
+
       const { size } = await this.storageRepository.stat(partPath);
 
       return { session, partPath, jsonPath, offset: size };

@@ -43,7 +43,11 @@ x-immich-checksum: 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12
 
 `x-immich-checksum` is **required** and must be the SHA-1 of the complete file, hex or base64
 encoded. It is verified against the assembled file before the asset is created, and it lets the
-server recognise a file it already has.
+server recognise a file it already has. It is also validated at creation, so a value that does not
+decode to a 20-byte digest is rejected before any bytes are sent.
+
+`Upload-Metadata` is validated at creation too, rather than when the upload completes — a bad
+`fileCreatedAt` would otherwise cost a full upload to discover.
 
 - `201 Created` — the response carries `Location` (the session URL to use for every later request)
   and `Upload-Expires`.
@@ -52,6 +56,7 @@ server recognise a file it already has.
   from `POST /api/assets`.
 - `400` — missing or malformed `Upload-Length`, `x-immich-checksum` or `Upload-Metadata`, an
   unsupported file type, or an upload that would exceed the user's storage quota.
+- `412` — the `Tus-Resumable` header names a version the server does not implement.
 
 `Upload-Metadata` is a comma-separated list of `key <base64(value)>` pairs. Keys map one-to-one onto
 the fields of `AssetMediaCreateDto`, and every value is a string, exactly as it would be in a
@@ -83,7 +88,8 @@ Content-Type: application/offset+octet-stream
 ```
 
 - `204 No Content` — the chunk was stored. The response's `Upload-Offset` is the new offset and is
-  authoritative; use it rather than assuming your chunk arrived whole.
+  authoritative; use it rather than assuming your chunk arrived whole. **Treat an offset that has
+  not advanced as fatal** — see the client notes below.
 - `409 Conflict` — `Upload-Offset` did not match the server's offset. The response's `Upload-Offset`
   carries the real value; resume from there. Do not retry the same offset.
 - `413 Payload Too Large` — the request would have pushed the file past `Upload-Length`.
@@ -91,7 +97,8 @@ Content-Type: application/offset+octet-stream
 
 Chunk size is the client's choice. 16 MiB is a good default: comfortably under Cloudflare's limit,
 and small enough that a failed chunk is cheap to redo. Halving the chunk size after a failure is a
-reasonable strategy on unreliable connections.
+reasonable strategy on unreliable connections — and specifically after a `413`, which means the
+proxy's body cap is below your chunk size.
 
 An interrupted `PATCH` is safe. Whatever bytes reached the server are kept, so a `HEAD` afterwards
 reports the true offset and the client resumes from it.
@@ -142,19 +149,29 @@ Tus-Resumable: 1.0.0
 ```
 
 `200 OK` carries `Upload-Offset`, `Upload-Length` and `Upload-Expires`. A `404` means the session is
-gone — expired, terminated, or never existed — and the client should create a new one.
+gone — expired, terminated, or never existed — and the client should create a new one. `Upload-Expires`
+is enforced: a session past its expiry is discarded on the next request that touches it.
 
-Session URLs are the natural thing to persist for resuming across restarts. Keying them by the
-file's SHA-1 works well, since the checksum is needed to create the session anyway.
+Session URLs are the natural thing to persist for resuming across restarts. Key them by the file's
+SHA-1 **and the metadata** the session was created with: a session is finalized with its own stored
+metadata, so resuming one created with different metadata (a different filename, or a different
+visibility) would apply the wrong values to the asset.
 
 ## Notes for client authors
 
 - **Detect support by attempting the creation request.** A `404` or `405` means the server predates
-  this API; fall back to `POST /api/assets`. Probing with `OPTIONS` is less reliable, because in
-  development builds the server's CORS middleware answers `OPTIONS` before it reaches the route.
+  this API; fall back to `POST /api/assets`. Probing with `OPTIONS` is less reliable for two
+  reasons: development builds answer `OPTIONS` from the CORS middleware before it reaches the
+  route, and unlike the spec's recommendation this endpoint requires authentication, like every
+  other Immich route.
 - **Sessions are scoped to the authenticated user.** An upload id belonging to someone else returns
   `404`, not `403`.
 - **Quota is checked at creation** against `Upload-Length`, and again when the asset is created.
+- **Stop if the offset does not advance.** The server answers `204` with the _unchanged_ offset when
+  a chunk stored nothing — a body cut short, or a proxy that swallowed it. Re-sending the same chunk
+  is then an infinite loop, which is the "upload appears to loop, re-sending the first chunk"
+  symptom in the reverse-proxy guide. Treat a missing, non-numeric, equal or lower `Upload-Offset`
+  as a hard failure rather than something to retry.
 - **Report progress from the server's offsets, clamped to never decrease.** Bytes-sent counters run
   ahead of what the server has committed, so a `204` or `409` reporting a lower offset will
   otherwise make a progress bar jump backwards.
@@ -171,6 +188,9 @@ Session state lives entirely on the filesystem, next to where single-request upl
 <media>/upload/<userId>/ab/cd/<uuid>.json         session metadata
 <media>/upload/<userId>/ab/cd/<uuid>.xmp          sidecar, if one was attached
 ```
+
+Abandoned sessions are swept from the user's tree when that user next creates one. Clients should
+still `DELETE` sessions they give up on rather than relying on it.
 
 Using the file's size as the offset is what makes an interrupted `PATCH` safe: there is no separate
 record that can disagree with the file after a crash. The owning user is part of the path, so

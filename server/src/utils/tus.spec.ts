@@ -65,8 +65,11 @@ describe('parseNonNegativeInt', () => {
     expect(parseNonNegativeInt(input)).toBeUndefined();
   });
 
-  it('should use the first value of an array header', () => {
-    expect(parseNonNegativeInt(['5', '9'])).toBe(5);
+  it('should reject a header a proxy duplicated', () => {
+    // Node joins repeated non-set-cookie headers into one comma-separated value, so this - not
+    // an array - is what a duplicated Upload-Offset actually looks like. Taking the first value
+    // silently would let a proxy decide where bytes get written.
+    expect(parseNonNegativeInt('5, 9')).toBeUndefined();
   });
 });
 
