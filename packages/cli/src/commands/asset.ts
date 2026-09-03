@@ -415,6 +415,12 @@ const uploadFile = async (
   const { baseUrl, headers } = defaults;
 
   const sidecarPath = findSidecar(input);
+  const fields = {
+    fileCreatedAt: stats.mtime.toISOString(),
+    fileModifiedAt: stats.mtime.toISOString(),
+    isFavorite: 'false',
+    visibility,
+  };
 
   // Chunked upload for large files, so a reverse proxy with a request-body cap does not block them
   // and a dropped connection does not cost the whole transfer. Needs the checksum computed during
@@ -428,26 +434,21 @@ const uploadFile = async (
       size: stats.size,
       filename: basename(input),
       checksum,
-      metadata: {
-        fileCreatedAt: stats.mtime.toISOString(),
-        fileModifiedAt: stats.mtime.toISOString(),
-        isFavorite: 'false',
-        visibility,
-      },
+      metadata: fields,
       sidecarPath,
     });
 
     // undefined means the server has no resumable upload API; fall through to multipart
     if (response) {
-      return response as AssetMediaResponseDto;
+      return response;
     }
   }
 
   const formData = new FormData();
-  formData.append('fileCreatedAt', stats.mtime.toISOString());
-  formData.append('fileModifiedAt', stats.mtime.toISOString());
+  formData.append('fileCreatedAt', fields.fileCreatedAt);
+  formData.append('fileModifiedAt', fields.fileModifiedAt);
   formData.append('fileSize', String(stats.size));
-  formData.append('isFavorite', 'false');
+  formData.append('isFavorite', fields.isFavorite);
   formData.append('assetData', new UploadFile(input, stats.size));
   if (visibility) {
     formData.append('visibility', visibility);

@@ -42,7 +42,8 @@ describe('resumableUpload', () => {
   let directory: string;
   let filepath: string;
 
-  const contents = Buffer.from('0123456789'.repeat(100)); // 1000 bytes
+  // each byte encodes its own offset, so a wrong range is detectable
+  const contents = Buffer.from(Array.from({ length: 1000 }, (_, i) => i % 251));
 
   const upload = (overrides: Partial<Parameters<typeof resumableUpload>[0]> = {}) =>
     resumableUpload({
@@ -88,6 +89,65 @@ describe('resumableUpload', () => {
       .slice(1)
       .map((request) => request.headers.get('upload-offset'));
     expect(offsets).toEqual(['0', '400', '800']);
+  });
+
+  it('should send exactly the bytes for each range', async () => {
+    // the whole point of the CLI client is createReadStream(start, end - 1); dropping the `- 1`
+    // overlaps every boundary by a byte and corrupts the upload, invisibly to the assertions above
+    fetchMocker
+      .mockResponseOnce('', { status: 201, headers: { location: '/api/assets/upload/abc' } })
+      .mockResponseOnce(undefined, { status: 204, headers: { 'upload-offset': '400' } })
+      .mockResponseOnce(undefined, { status: 204, headers: { 'upload-offset': '800' } })
+      .mockResponseOnce(JSON.stringify(created), { status: 201 });
+
+    await upload();
+
+    const bodies = await Promise.all(
+      fetchMocker
+        .requests()
+        .slice(1)
+        .map(async (request) => Buffer.from(await request.arrayBuffer())),
+    );
+
+    expect(bodies[0]).toEqual(contents.subarray(0, 400));
+    expect(bodies[1]).toEqual(contents.subarray(400, 800));
+    expect(bodies[2]).toEqual(contents.subarray(800, 1000));
+    expect(Buffer.concat(bodies)).toEqual(contents);
+  });
+
+  it('should give up rather than re-sending a chunk the server never advanced past', async () => {
+    fetchMocker
+      .mockResponseOnce('', { status: 201, headers: { location: '/api/assets/upload/abc' } })
+      .mockResponse(undefined, { status: 204, headers: { 'upload-offset': '0' } });
+
+    await expect(upload()).rejects.toThrow(/did not advance/);
+  });
+
+  it('should abandon the session when a chunk fails', async () => {
+    // otherwise each of the CLI's three retries leaves a multi-GB .part behind
+    fetchMocker
+      .mockResponseOnce('', { status: 201, headers: { location: '/api/assets/upload/abc' } })
+      .mockResponseOnce('nope', { status: 500 })
+      .mockResponseOnce(undefined, { status: 204 });
+
+    await expect(upload()).rejects.toThrow(/500/);
+    expect(calls().at(-1)).toBe(`DELETE ${baseUrl}/assets/upload/abc`);
+  });
+
+  it('should abandon the session when the sidecar is rejected, before sending any bytes', async () => {
+    const sidecarPath = join(directory, 'video.mp4.xmp');
+    await writeFile(sidecarPath, '<x:xmpmeta/>');
+    fetchMocker
+      .mockResponseOnce('', { status: 201, headers: { location: '/api/assets/upload/abc' } })
+      .mockResponseOnce('too big', { status: 413 })
+      .mockResponseOnce(undefined, { status: 204 });
+
+    await expect(upload({ chunkSize: CHUNK_SIZE, sidecarPath })).rejects.toThrow(/413/);
+    expect(calls()).toEqual([
+      `POST ${baseUrl}/assets/upload`,
+      `PUT ${baseUrl}/assets/upload/abc/sidecar`,
+      `DELETE ${baseUrl}/assets/upload/abc`,
+    ]);
   });
 
   it('should declare the length, checksum and metadata when creating', async () => {

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 // `Request` collides with http's; only http's is used here.
 import 'package:background_downloader/background_downloader.dart' hide Request;
@@ -114,40 +115,33 @@ class UploadRepository {
       baseRequest.files.add(assetRawUploadData);
 
       final response = await NetworkRepository.client.send(baseRequest);
-      final responseBodyString = await response.stream.bytesToString();
 
-      if (![200, 201].contains(response.statusCode)) {
-        String? errorMessage;
-
-        if (response.statusCode == 413) {
-          errorMessage = 'Error(413) File is too large to upload';
-          return UploadResult.error(statusCode: response.statusCode, errorMessage: errorMessage);
-        }
-
-        try {
-          final error = jsonDecode(responseBodyString);
-          errorMessage = error['message'] ?? error['error'];
-        } catch (_) {
-          errorMessage = responseBodyString.isNotEmpty
-              ? responseBodyString
-              : 'Upload failed with status ${response.statusCode}';
-        }
-
-        return UploadResult.error(statusCode: response.statusCode, errorMessage: errorMessage);
-      }
-
-      try {
-        final responseBody = jsonDecode(responseBodyString);
-        return UploadResult.success(remoteAssetId: responseBody['id'] as String);
-      } catch (e) {
-        return UploadResult.error(errorMessage: 'Failed to parse server response');
-      }
+      final res = await Response.fromStream(response);
+      return [HttpStatus.ok, HttpStatus.created].contains(res.statusCode)
+          ? _resultFrom(res, logContext)
+          : _errorFrom(res, logContext);
     } on RequestAbortedException {
       logger.warning("Upload $logContext was cancelled");
       return UploadResult.cancelled();
     } catch (error, stackTrace) {
       logger.warning("Error uploading $logContext: ${error.toString()}: $stackTrace");
       return UploadResult.error(errorMessage: error.toString());
+    }
+  }
+
+  /// Abandon a tus session so its bytes are not left on the server until they expire.
+  Future<void> terminateResumableSession(Uri url, {Client? httpClient}) async {
+    try {
+      await _send(
+        httpClient ?? NetworkRepository.client,
+        'DELETE',
+        url,
+        cancelToken: null,
+        headers: const {'Tus-Resumable': kTusVersion},
+      );
+    } catch (error) {
+      // best effort: the server's expiry sweep is the backstop
+      logger.warning('Failed to terminate resumable session $url: $error');
     }
   }
 
@@ -215,6 +209,7 @@ class UploadRepository {
   }) async {
     final client = httpClient ?? NetworkRepository.client;
     final total = file.lengthSync();
+    RandomAccessFile? handle;
 
     try {
       final session = await createResumableSession(
@@ -237,7 +232,9 @@ class UploadRepository {
       }
 
       final url = session.url!;
+      handle = await file.open();
       var offset = 0;
+      var reported = 0;
 
       while (offset < total) {
         if (cancelToken?.isCompleted ?? false) {
@@ -251,7 +248,7 @@ class UploadRepository {
           url,
           cancelToken: cancelToken,
           headers: {'Tus-Resumable': kTusVersion, 'Upload-Offset': '$offset', 'Content-Type': kTusOffsetContentType},
-          body: await file.openRead(range.start, range.end).expand((chunk) => chunk).toList(),
+          body: await _readRange(handle, range.start, range.end - range.start),
         );
 
         // the server is the authority on the offset; a 409 carries the real one so we can resume
@@ -273,8 +270,17 @@ class UploadRepository {
           return _errorFrom(response, logContext);
         }
 
-        offset = parseUploadOffset(response.headers) ?? range.end;
-        onProgress?.call(offset, total);
+        // a 204 whose offset did not move means the chunk stored nothing; re-sending it forever
+        // is the loop the reverse-proxy docs warn about
+        final next = parseUploadOffset(response.headers) ?? range.end;
+        if (next <= offset) {
+          return UploadResult.error(errorMessage: 'Resumable upload stalled: server offset did not advance');
+        }
+
+        offset = next;
+        // clamped like the web client: the bar must not go back if the server commits less
+        reported = next > reported ? next : reported;
+        onProgress?.call(reported, total);
       }
 
       return UploadResult.error(errorMessage: 'Resumable upload finished without a response from the server');
@@ -284,7 +290,16 @@ class UploadRepository {
     } catch (error, stackTrace) {
       logger.warning("Error uploading $logContext: $error: $stackTrace");
       return UploadResult.error(errorMessage: error.toString());
+    } finally {
+      await handle?.close();
     }
+  }
+
+  /// Reads exactly [length] bytes from [start] as a Uint8List, which `bodyBytes` stores without
+  /// copying. Streaming the range through `expand` would materialise one Dart int per byte.
+  Future<Uint8List> _readRange(RandomAccessFile handle, int start, int length) async {
+    await handle.setPosition(start);
+    return handle.read(length);
   }
 
   Future<Response> _send(
@@ -330,7 +345,7 @@ class UploadRepository {
       message = response.body.isNotEmpty ? response.body : 'Upload failed with status ${response.statusCode}';
     }
 
-    logger.warning("Resumable upload $logContext failed: ${response.statusCode} $message");
+    logger.warning("Upload $logContext failed: ${response.statusCode} $message");
     return UploadResult.error(statusCode: response.statusCode, errorMessage: message);
   }
 }

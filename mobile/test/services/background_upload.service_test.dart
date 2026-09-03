@@ -45,6 +45,7 @@ void main() {
 
     await Store.put(StoreKey.serverEndpoint, 'http://test-server.com');
     await Store.put(StoreKey.deviceId, 'test-device-id');
+    registerFallbackValue(Uri.parse('http://test-server.com'));
   });
 
   setUp(() {
@@ -539,6 +540,7 @@ void main() {
       setUp(() async {
         file = sparseFile('video.mp4', large);
         when(() => mockUploadRepository.enqueueBackgroundAll(any())).thenAnswer((_) async => [true]);
+        when(() => mockUploadRepository.terminateResumableSession(any())).thenAnswer((_) async {});
 
         task = await sut.buildChunkTask(
           file,
@@ -610,16 +612,50 @@ void main() {
         expect(enqueued().single.headers['Upload-Offset'], '4096');
       });
 
-      test('does not loop when a failure repeats the same offset', () async {
+      test('abandons the upload when a failure repeats the same offset', () async {
         await sut.handleTaskStatusUpdate(TaskStatusUpdate(task, TaskStatus.failed, null, null, {'upload-offset': '0'}));
 
         verifyNever(() => mockUploadRepository.enqueueBackgroundAll(any()));
+        // the session must be dropped, not left occupying disk for a week
+        verify(() => mockUploadRepository.terminateResumableSession(any())).called(1);
       });
 
-      test('ignores a failure with no offset to resume from', () async {
+      test('abandons the upload on a terminal failure with no offset to resume from', () async {
+        // a 413/460/400, an expired session or a dead network carries no Upload-Offset. Leaving
+        // the chain silently stopped meant the next backup run re-uploaded the asset from byte 0.
         await sut.handleTaskStatusUpdate(TaskStatusUpdate(task, TaskStatus.failed));
 
         verifyNever(() => mockUploadRepository.enqueueBackgroundAll(any()));
+        verify(() => mockUploadRepository.terminateResumableSession(any())).called(1);
+      });
+
+      test('abandons the upload when the next chunk cannot be queued', () async {
+        when(() => mockUploadRepository.enqueueBackgroundAll(any())).thenAnswer((_) async => [false]);
+
+        await sut.handleTaskStatusUpdate(
+          TaskStatusUpdate(task, TaskStatus.complete, null, null, {'upload-offset': '$kUploadChunkSize'}),
+        );
+
+        verify(() => mockUploadRepository.terminateResumableSession(any())).called(1);
+      });
+
+      test('abandons the upload when a 204 does not advance the offset', () async {
+        await sut.handleTaskStatusUpdate(
+          TaskStatusUpdate(task, TaskStatus.complete, null, null, {'upload-offset': '0'}),
+        );
+
+        verifyNever(() => mockUploadRepository.enqueueBackgroundAll(any()));
+        verify(() => mockUploadRepository.terminateResumableSession(any())).called(1);
+      });
+
+      test('gives each queued chunk a distinct task id', () async {
+        // background_downloader dedupes by taskId, so a 409 sending the chain back to an offset it
+        // has already used would have its retry silently dropped
+        await sut.handleTaskStatusUpdate(
+          TaskStatusUpdate(task, TaskStatus.failed, null, null, {'upload-offset': '4096'}),
+        );
+
+        expect(enqueued().single.taskId, isNot(task.taskId));
       });
     });
   });
