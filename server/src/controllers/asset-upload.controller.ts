@@ -50,6 +50,18 @@ import { UUIDParamDto } from 'src/validation';
 export class AssetUploadController {
   constructor(private service: AssetUploadService) {}
 
+  /**
+   * tus requires 412 when the client advertises a version the server does not implement. A missing
+   * header is tolerated: Immich's own clients send it, but the protocol only mandates the check on
+   * mismatch and being strict would break nothing useful.
+   */
+  private requireTusVersion(req: Request) {
+    const version = fromMaybeArray(req.headers['tus-resumable']);
+    if (version !== undefined && version !== TUS_VERSION) {
+      throw new HttpException(`Unsupported tus version: ${version}`, HttpStatus.PRECONDITION_FAILED);
+    }
+  }
+
   @Options()
   @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
   @HttpCode(HttpStatus.NO_CONTENT)
@@ -66,6 +78,8 @@ export class AssetUploadController {
   @UseInterceptors(AssetUploadInterceptor)
   @HttpCode(HttpStatus.CREATED)
   async create(@Auth() auth: AuthDto, @Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    this.requireTusVersion(req);
+
     const uploadLength = parseNonNegativeInt(req.headers['upload-length']);
     if (uploadLength === undefined || uploadLength === 0) {
       throw new BadRequestException('Upload-Length must be a positive integer');
@@ -114,6 +128,8 @@ export class AssetUploadController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
+    this.requireTusVersion(req);
+
     if (req.headers['content-type'] !== TUS_OFFSET_CONTENT_TYPE) {
       throw new BadRequestException(`Content-Type must be ${TUS_OFFSET_CONTENT_TYPE}`);
     }
@@ -151,6 +167,8 @@ export class AssetUploadController {
   @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
   @HttpCode(HttpStatus.NO_CONTENT)
   async sidecar(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto, @Req() req: Request) {
+    this.requireTusVersion(req);
+
     // body-parser only skips bodies whose content type it does not handle, so a client sending
     // application/json would have its sidecar consumed before it reaches here
     const contentType = fromMaybeArray(req.headers['content-type']);

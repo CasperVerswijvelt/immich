@@ -1,5 +1,5 @@
 import { AssetMediaResponseDto, AssetMediaStatus, getAssetInfo, getMyUser, LoginResponseDto } from '@immich/sdk';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createUserDto } from 'src/fixtures';
 import { makeRandomImage } from 'src/generators';
 import { errorDto } from 'src/responses';
@@ -58,6 +58,7 @@ describe('/assets/upload', () => {
   let user1: LoginResponseDto;
   let user2: LoginResponseDto;
   let quotaUser: LoginResponseDto;
+  let parityUsers: Record<string, LoginResponseDto>;
 
   beforeAll(async () => {
     await utils.resetDatabase();
@@ -67,6 +68,11 @@ describe('/assets/upload', () => {
       utils.userSetup(admin.accessToken, createUserDto.create('upload2')),
       utils.userSetup(admin.accessToken, createUserDto.userQuota),
     ]);
+
+    parityUsers = {
+      multipart: await utils.userSetup(admin.accessToken, createUserDto.create('parity-multipart')),
+      resumable: await utils.userSetup(admin.accessToken, createUserDto.create('parity-resumable')),
+    };
   });
 
   describe('OPTIONS /assets/upload', () => {
@@ -136,6 +142,14 @@ describe('/assets/upload', () => {
       expect(status).toBe(400);
     });
 
+    it('should reject metadata that fails validation before any bytes are sent', async () => {
+      const { status } = await create(user1.accessToken, makeRandomImage(), {
+        metadata: metadata({ filename: 'example.png', fileCreatedAt: 'not-a-date' }),
+      });
+
+      expect(status).toBe(400);
+    });
+
     it('should reject an unsupported file type before any bytes are sent', async () => {
       const { status } = await create(user1.accessToken, randomBytes(10), {
         metadata: defaultMetadata('notes.txt'),
@@ -176,7 +190,7 @@ describe('/assets/upload', () => {
     });
 
     it('should not find an unknown session', async () => {
-      const { status } = await head(user1.accessToken, '/api/assets/upload/does-not-exist');
+      const { status } = await head(user1.accessToken, `/api/assets/upload/${randomUUID()}`);
 
       expect(status).toBe(404);
     });
@@ -272,17 +286,6 @@ describe('/assets/upload', () => {
       expect(body.id).not.toBe(existing.id);
     });
 
-    it('should reject metadata that fails validation, once the bytes arrive', async () => {
-      const bytes = makeRandomImage();
-      const { headers } = await create(user1.accessToken, bytes, {
-        metadata: metadata({ filename: 'example.png', fileCreatedAt: 'not-a-date' }),
-      });
-
-      const { status } = await patch(user1.accessToken, headers.location, 0, bytes);
-
-      expect(status).toBe(400);
-    });
-
     it("should not accept bytes for another user's session", async () => {
       const bytes = makeRandomImage();
       const { headers } = await create(user1.accessToken, bytes);
@@ -321,6 +324,38 @@ describe('/assets/upload', () => {
       expect(status).toBe(201);
     });
 
+    it('should reject a sidecar over the size cap without harming the session', async () => {
+      const bytes = makeRandomImage();
+      const { headers } = await create(user1.accessToken, bytes);
+
+      const oversized = await request(app)
+        .put(`${path(headers.location)}/sidecar`)
+        .set('Authorization', `Bearer ${user1.accessToken}`)
+        .set('Content-Type', 'application/xml')
+        .send(Buffer.alloc(2 * 1024 * 1024));
+      expect(oversized.status).toBe(413);
+
+      // the session survives and the upload still completes
+      const state = await head(user1.accessToken, headers.location);
+      expect(state.status).toBe(200);
+      expect(state.headers['upload-offset']).toBe('0');
+      const { status } = await patch(user1.accessToken, headers.location, 0, bytes);
+      expect(status).toBe(201);
+    });
+
+    it("should not attach a sidecar to another user's session", async () => {
+      const bytes = makeRandomImage();
+      const { headers } = await create(user1.accessToken, bytes);
+
+      const { status } = await request(app)
+        .put(`${path(headers.location)}/sidecar`)
+        .set('Authorization', `Bearer ${user2.accessToken}`)
+        .set('Content-Type', 'application/xml')
+        .send('<x:xmpmeta/>');
+
+      expect(status).toBe(404);
+    });
+
     it('should reject an empty sidecar', async () => {
       const { headers } = await create(user1.accessToken, makeRandomImage());
 
@@ -331,6 +366,36 @@ describe('/assets/upload', () => {
         .send('');
 
       expect(status).toBe(400);
+    });
+  });
+
+  describe('malformed ids', () => {
+    it.each(['....', '%2e%2e%2f%2e%2e', 'not-a-uuid', 'aa%00bb'])(
+      'should reject %s without touching the filesystem',
+      async (id) => {
+        // the id reaches path construction, so it is validated before any fs call
+        const responses = await Promise.all([
+          head(user1.accessToken, `/api/assets/upload/${id}`),
+          patch(user1.accessToken, `/api/assets/upload/${id}`, 0, Buffer.from('x')),
+          request(app).delete(`/assets/upload/${id}`).set('Authorization', `Bearer ${user1.accessToken}`),
+        ]);
+
+        for (const response of responses) {
+          expect(response.status).toBe(400);
+        }
+      },
+    );
+
+    it('should not accept a prefix of a real session id', async () => {
+      const { headers } = await create(user1.accessToken, makeRandomImage());
+      const id = headers.location.split('/').pop() as string;
+
+      const { status } = await head(user1.accessToken, `/api/assets/upload/${id.slice(0, 8)}`);
+
+      expect(status).toBe(400);
+      // and the real session is untouched
+      const survives = await head(user1.accessToken, headers.location);
+      expect(survives.status).toBe(200);
     });
   });
 
@@ -401,7 +466,9 @@ describe('/assets/upload', () => {
       ],
     ])('should store byte-identical assets via %s', async (_, upload) => {
       const bytes = makeRandomImage();
-      const user = await utils.userSetup(admin.accessToken, createUserDto.create(`parity-${_}`));
+      // the user is created in beforeAll: createUserDto emails are deterministic and CI retries
+      // the test body, so creating it here fails with "email already in use" on every retry
+      const user = parityUsers[_];
 
       const asset = await upload(user.accessToken, bytes);
       const info = await getAssetInfo({ id: asset.id }, { headers: asBearerAuth(user.accessToken) });

@@ -396,6 +396,8 @@ export const utils = {
     const chunkSize = options?.chunkSize ?? bytes.length;
 
     const metadata = Object.entries({ ..._dto, filename })
+      // the binary fields are not metadata; String()-ing them sends `[object Object]`
+      .filter(([key]) => key !== 'assetData' && key !== 'sidecarData')
       .filter(([, value]) => value !== undefined)
       .map(([key, value]) => `${key} ${Buffer.from(String(value), 'utf8').toString('base64')}`)
       .join(',');
@@ -406,7 +408,7 @@ export const utils = {
       .set('Tus-Resumable', '1.0.0')
       .set('Upload-Length', String(bytes.length))
       .set('Upload-Metadata', metadata)
-      .set('x-immich-checksum', createHash('sha1').update(bytes).digest('hex'));
+      .set('x-immich-checksum', utils.sha1(bytes));
 
     if (created.status === 200) {
       return created.body as AssetMediaResponseDto;

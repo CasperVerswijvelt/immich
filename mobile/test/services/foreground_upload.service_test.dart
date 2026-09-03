@@ -4,6 +4,7 @@ import 'package:drift/drift.dart' hide isNull, isNotNull;
 import 'package:drift/native.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:immich_mobile/domain/models/asset/base_asset.model.dart';
 import 'package:immich_mobile/domain/models/store.model.dart';
 import 'package:immich_mobile/domain/services/store.service.dart';
 import 'package:immich_mobile/entities/store.entity.dart';
@@ -12,6 +13,7 @@ import 'package:immich_mobile/infrastructure/repositories/settings.repository.da
 import 'package:immich_mobile/infrastructure/repositories/store.repository.dart';
 import 'package:immich_mobile/repositories/upload.repository.dart';
 import 'package:immich_mobile/services/foreground_upload.service.dart';
+import 'package:immich_mobile/utils/tus.dart';
 import 'package:mocktail/mocktail.dart';
 
 import '../api.mocks.dart';
@@ -195,6 +197,104 @@ void main() {
       await sut.uploadSingleAsset(asset, null, callbacks: const UploadCallbacks());
 
       expect(names, equals(['DJI_0001.jpg']));
+    });
+  });
+
+  group('resumable selection', () {
+    /// A real file big enough to cross the one-chunk threshold, written sparsely.
+    File sparse(int size, {String name = 'video.mp4'}) {
+      final file = File('${Directory.systemTemp.createTempSync().path}/$name');
+      final handle = file.openSync(mode: FileMode.write);
+      handle.setPositionSync(size - 1);
+      handle.writeByteSync(0);
+      handle.closeSync();
+      addTearDown(() => file.parent.deleteSync(recursive: true));
+      return file;
+    }
+
+    void stubEntity(LocalAsset asset, File file) {
+      final mockEntity = MockAssetEntity();
+      when(() => mockEntity.isLivePhoto).thenReturn(false);
+      when(() => mockStorageRepository.getAssetEntityForAsset(asset)).thenAnswer((_) async => mockEntity);
+      when(() => mockStorageRepository.isAssetAvailableLocally(asset.id)).thenAnswer((_) async => true);
+      when(() => mockStorageRepository.getFileForAsset(asset.id)).thenAnswer((_) async => file);
+      when(() => mockAssetMediaRepository.getOriginalFilename(asset.id)).thenAnswer((_) async => 'video.mp4');
+    }
+
+    void stubResumable(UploadResult? result) {
+      when(
+        () => mockUploadRepository.uploadFileResumable(
+          file: any(named: 'file'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: any(named: 'checksum'),
+          fields: any(named: 'fields'),
+          cancelToken: any(named: 'cancelToken'),
+          onProgress: any(named: 'onProgress'),
+          logContext: any(named: 'logContext'),
+        ),
+      ).thenAnswer((_) async => result);
+    }
+
+    test('uses the resumable path for a large hashed asset', () async {
+      final asset = LocalAssetStub.image1.copyWith(checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=');
+      stubEntity(asset, sparse(kUploadChunkSize * 2));
+      stubResumable(UploadResult.success(remoteAssetId: 'asset-id'));
+
+      await sut.uploadSingleAsset(asset, null, callbacks: const UploadCallbacks());
+
+      verify(
+        () => mockUploadRepository.uploadFileResumable(
+          file: any(named: 'file'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=',
+          fields: any(named: 'fields'),
+          cancelToken: any(named: 'cancelToken'),
+          onProgress: any(named: 'onProgress'),
+          logContext: any(named: 'logContext'),
+        ),
+      ).called(1);
+    });
+
+    test('falls back to a single request when the server has no resumable api', () async {
+      // this fallback is what keeps old servers working, and had no coverage at all
+      final asset = LocalAssetStub.image1.copyWith(checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=');
+      stubEntity(asset, sparse(kUploadChunkSize * 2));
+      stubResumable(null);
+      final names = captureOriginalFileNames();
+
+      await sut.uploadSingleAsset(asset, null, callbacks: const UploadCallbacks());
+
+      expect(names, equals(['video.mp4']));
+    });
+
+    test('leaves a small asset on the single-request path', () async {
+      final asset = LocalAssetStub.image1.copyWith(checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=');
+      stubEntity(asset, sparse(1024));
+      final names = captureOriginalFileNames();
+
+      await sut.uploadSingleAsset(asset, null, callbacks: const UploadCallbacks());
+
+      expect(names, equals(['video.mp4']));
+      verifyNever(
+        () => mockUploadRepository.uploadFileResumable(
+          file: any(named: 'file'),
+          originalFileName: any(named: 'originalFileName'),
+          checksum: any(named: 'checksum'),
+          fields: any(named: 'fields'),
+          cancelToken: any(named: 'cancelToken'),
+          onProgress: any(named: 'onProgress'),
+          logContext: any(named: 'logContext'),
+        ),
+      );
+    });
+
+    test('leaves an unhashed asset on the single-request path', () async {
+      stubEntity(LocalAssetStub.image1, sparse(kUploadChunkSize * 2));
+      final names = captureOriginalFileNames();
+
+      await sut.uploadSingleAsset(LocalAssetStub.image1, null, callbacks: const UploadCallbacks());
+
+      expect(names, equals(['video.mp4']));
     });
   });
 }
