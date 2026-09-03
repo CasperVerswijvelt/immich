@@ -1,5 +1,11 @@
-import { parseNonNegativeInt, parseUploadMetadata, serializeUploadMetadata, validateOffset } from 'src/utils/tus';
+import { parseNonNegativeInt, parseUploadMetadata, validateOffset } from 'src/utils/tus';
 import { describe, expect, it } from 'vitest';
+
+/** Encodes the way a client does, so the parser is tested against the real wire format. */
+const encode = (metadata: Record<string, string>) =>
+  Object.entries(metadata)
+    .map(([key, value]) => (value === '' ? key : `${key} ${Buffer.from(value, 'utf8').toString('base64')}`))
+    .join(',');
 
 describe('parseUploadMetadata', () => {
   it('should return an empty object for a missing or blank header', () => {
@@ -33,7 +39,7 @@ describe('parseUploadMetadata', () => {
 
   it('should round-trip non-ascii filenames', () => {
     const metadata = { filename: 'æøå 日本語 🙂.jpg' };
-    expect(parseUploadMetadata(serializeUploadMetadata(metadata))).toEqual(metadata);
+    expect(parseUploadMetadata(encode(metadata))).toEqual(metadata);
   });
 
   it('should reject a pair with more than one space', () => {
@@ -43,16 +49,6 @@ describe('parseUploadMetadata', () => {
   it('should reject an empty pair', () => {
     expect(parseUploadMetadata('filename YS5qcGc=,,isFavorite dHJ1ZQ==')).toBeUndefined();
     expect(parseUploadMetadata(',')).toBeUndefined();
-  });
-});
-
-describe('serializeUploadMetadata', () => {
-  it('should emit a bare key for an empty value', () => {
-    expect(serializeUploadMetadata({ flag: '' })).toBe('flag');
-  });
-
-  it('should base64 encode values', () => {
-    expect(serializeUploadMetadata({ filename: 'a.jpg' })).toBe(`filename ${Buffer.from('a.jpg').toString('base64')}`);
   });
 });
 

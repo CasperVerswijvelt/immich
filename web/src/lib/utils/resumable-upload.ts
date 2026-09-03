@@ -1,4 +1,5 @@
 import { getBaseUrl, type AssetMediaResponseDto } from '@immich/sdk';
+import { trackUpload } from '$lib/utils/upload-registry';
 
 /**
  * Client for Immich's tus 1.0.0 resumable upload API (see the server's AssetUploadController).
@@ -20,7 +21,13 @@ const MIN_CHUNK_SIZE = 1024 * 1024;
 /** Resumable uploads only pay off once a file is bigger than a single chunk. */
 export const shouldUseResumableUpload = (size: number) => size > CHUNK_SIZE;
 
-const storageKey = (checksum: string) => `immich:upload:${checksum}`;
+/**
+ * Keyed by checksum *and* metadata: a session is finalized with the metadata it was created with,
+ * so resuming across a change (e.g. re-uploading the same file into a locked folder) would apply
+ * the wrong visibility or filename.
+ */
+const storageKey = (checksum: string, metadata: Record<string, string | undefined>) =>
+  `immich:upload:${checksum}:${JSON.stringify(metadata)}`;
 
 type XhrResult = { status: number; body: unknown; header: (name: string) => string | null };
 
@@ -37,17 +44,31 @@ const request = (options: {
   onProgress?: (loaded: number) => void;
 }): Promise<XhrResult> =>
   new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
+    if (options.signal?.aborted) {
+      reject(new DOMException('Upload aborted', 'AbortError'));
+      return;
+    }
 
-    xhr.addEventListener('load', () =>
+    const xhr = new XMLHttpRequest();
+    // the same registry uploadRequest uses, so cancelUploadRequests() on logout aborts chunks too
+    const unsubscribe = trackUpload(() => xhr.abort());
+
+    xhr.addEventListener('load', () => {
+      unsubscribe();
       resolve({
         status: xhr.status,
         body: xhr.response,
         header: (name) => xhr.getResponseHeader(name),
-      }),
-    );
-    xhr.addEventListener('error', () => reject(new Error(`Upload request failed: ${options.method} ${options.url}`)));
-    xhr.addEventListener('abort', () => reject(new DOMException('Upload aborted', 'AbortError')));
+      });
+    });
+    xhr.addEventListener('error', () => {
+      unsubscribe();
+      reject(new Error(`Upload request failed: ${options.method} ${options.url}`));
+    });
+    xhr.addEventListener('abort', () => {
+      unsubscribe();
+      reject(new DOMException('Upload aborted', 'AbortError'));
+    });
 
     if (options.onProgress) {
       xhr.upload.addEventListener('progress', (event) => options.onProgress?.(event.loaded));
@@ -106,13 +127,14 @@ export const resumableUpload = async (options: ResumableUploadOptions): Promise<
     onProgress?.(loaded, file.size);
   };
 
-  let location = resume(checksum);
+  const key = storageKey(checksum, { ...metadata, filename: file.name });
+  let location = resume(key);
   let offset = 0;
 
   if (location) {
     const current = await head(location + search, signal);
     if (current === undefined) {
-      forget(checksum);
+      forget(key);
       location = undefined;
     } else {
       offset = current;
@@ -130,7 +152,7 @@ export const resumableUpload = async (options: ResumableUploadOptions): Promise<
     }
 
     location = created.location;
-    remember(checksum, location);
+    remember(key, location);
   }
 
   let chunkSize = options.chunkSize ?? CHUNK_SIZE;
@@ -178,16 +200,35 @@ export const resumableUpload = async (options: ResumableUploadOptions): Promise<
     }
 
     if (response.status === 200 || response.status === 201) {
-      forget(checksum);
+      forget(key);
       report(file.size);
       return response.body as AssetMediaResponseDto;
+    }
+
+    // A 413 means this proxy's body cap is below our chunk size; a 5xx is usually transient.
+    // Both are worth retrying with a smaller chunk before giving up on a resumable upload.
+    if (response.status === 413 || response.status >= 500) {
+      if (chunkSize <= MIN_CHUNK_SIZE) {
+        throw new Error(`Resumable upload failed with status ${response.status}`);
+      }
+
+      chunkSize = Math.max(MIN_CHUNK_SIZE, Math.floor(chunkSize / 2));
+      continue;
     }
 
     if (response.status !== 204) {
       throw new Error(`Resumable upload failed with status ${response.status}`);
     }
 
-    offset = Number(response.header('Upload-Offset') ?? end);
+    // The server answers 204 with the unchanged offset when a chunk stored nothing (a body cut
+    // short, a proxy that swallowed it). Re-sending the same chunk forever is the failure mode the
+    // reverse-proxy docs warn about, so treat a non-advancing offset as fatal.
+    const next = Number(response.header('Upload-Offset') ?? end);
+    if (!Number.isSafeInteger(next) || next <= offset) {
+      throw new Error('Resumable upload stalled: server offset did not advance');
+    }
+
+    offset = next;
     report(offset);
   }
 
@@ -195,13 +236,19 @@ export const resumableUpload = async (options: ResumableUploadOptions): Promise<
 };
 
 /** Abandon a session server-side so its bytes are not left on disk until they expire. */
-export const cancelResumableUpload = async (checksum: string, queryParams?: string) => {
-  const location = resume(checksum);
+export const cancelResumableUpload = async (
+  file: File,
+  checksum: string,
+  metadata: Record<string, string | undefined>,
+  queryParams?: string,
+) => {
+  const key = storageKey(checksum, { ...metadata, filename: file.name });
+  const location = resume(key);
   if (!location) {
     return;
   }
 
-  forget(checksum);
+  forget(key);
   await request({
     method: 'DELETE',
     url: location + (queryParams ? `?${queryParams}` : ''),
@@ -263,25 +310,25 @@ const head = async (url: string, signal?: AbortSignal) => {
   return Number.isSafeInteger(offset) && offset >= 0 ? offset : undefined;
 };
 
-const resume = (checksum: string) => {
+const resume = (key: string) => {
   try {
-    return localStorage.getItem(storageKey(checksum)) ?? undefined;
+    return localStorage.getItem(key) ?? undefined;
   } catch {
     return undefined;
   }
 };
 
-const remember = (checksum: string, location: string) => {
+const remember = (key: string, location: string) => {
   try {
-    localStorage.setItem(storageKey(checksum), location);
+    localStorage.setItem(key, location);
   } catch {
     // private browsing or blocked site data: resume across reloads is a convenience, not a requirement
   }
 };
 
-const forget = (checksum: string) => {
+const forget = (key: string) => {
   try {
-    localStorage.removeItem(storageKey(checksum));
+    localStorage.removeItem(key);
   } catch {
     // as above
   }

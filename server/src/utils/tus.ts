@@ -4,9 +4,10 @@
  * Everything here is pure so it can be unit tested without an HTTP or storage harness.
  * The stateful parts live in `AssetUploadService`.
  */
-import { IncomingHttpHeaders } from 'node:http';
+import { fromMaybeArray } from 'src/utils/request';
 
 export const TUS_VERSION = '1.0.0';
+export const TUS_OFFSET_CONTENT_TYPE = 'application/offset+octet-stream';
 export const TUS_EXTENSIONS = ['creation', 'expiration', 'termination'] as const;
 
 /** How long an unfinished upload survives before it can be swept. */
@@ -46,18 +47,12 @@ export const parseUploadMetadata = (header?: string): TusMetadata | undefined =>
   return result;
 };
 
-/** Serialize metadata back into an `Upload-Metadata` header value. */
-export const serializeUploadMetadata = (metadata: TusMetadata): string =>
-  Object.entries(metadata)
-    .map(([key, value]) => (value === '' ? key : `${key} ${Buffer.from(value, 'utf8').toString('base64')}`))
-    .join(',');
-
 /**
  * Parse a header that must be a non-negative integer (`Upload-Length`, `Upload-Offset`).
  * Returns undefined for anything else — including floats, negatives and `1e3`.
  */
 export const parseNonNegativeInt = (value?: string | string[]): number | undefined => {
-  const raw = Array.isArray(value) ? value[0] : value;
+  const raw = fromMaybeArray(value);
   if (raw === undefined || !/^\d+$/.test(raw)) {
     return undefined;
   }
@@ -77,9 +72,4 @@ export const validateOffset = (claimed: number, size: number, uploadLength: numb
     return 'complete';
   }
   return claimed === size ? 'ok' : 'conflict';
-};
-
-export const getHeader = (headers: IncomingHttpHeaders, name: string): string | undefined => {
-  const value = headers[name];
-  return Array.isArray(value) ? value[0] : value;
 };

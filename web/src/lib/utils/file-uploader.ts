@@ -17,7 +17,7 @@ import { uploadAssetsStore } from '$lib/stores/upload';
 import { UploadState } from '$lib/types';
 import { uploadRequest } from '$lib/utils';
 import { ExecutorQueue } from '$lib/utils/executor-queue';
-import { resumableUpload, shouldUseResumableUpload } from '$lib/utils/resumable-upload';
+import { cancelResumableUpload, resumableUpload, shouldUseResumableUpload } from '$lib/utils/resumable-upload';
 import { asQueryString } from '$lib/utils/shared-links';
 import { handleError } from './handle-error';
 
@@ -213,18 +213,31 @@ async function fileUploader({
 
     if (!responseData && checksum && shouldUseResumableUpload(assetFile.size)) {
       uploadAssetsStore.updateItem(deviceAssetId, { message: $t('asset_uploading') });
-      responseData = await resumableUpload({
-        file: assetFile,
-        checksum,
-        metadata: {
-          fileCreatedAt,
-          fileModifiedAt: new Date(assetFile.lastModified).toISOString(),
-          isFavorite: 'false',
-          visibility: isLockedAssets ? AssetVisibility.Locked : undefined,
-        },
-        queryParams: asQueryString(authManager.params),
-        onProgress: (loaded, total) => uploadAssetsStore.updateProgress(deviceAssetId, loaded, total),
-      });
+      const metadata = {
+        fileCreatedAt,
+        fileModifiedAt: new Date(assetFile.lastModified).toISOString(),
+        isFavorite: 'false',
+        visibility: isLockedAssets ? AssetVisibility.Locked : undefined,
+      };
+      const queryParams = asQueryString(authManager.params);
+
+      try {
+        responseData = await resumableUpload({
+          file: assetFile,
+          checksum,
+          metadata,
+          queryParams,
+          onProgress: (loaded, total) => uploadAssetsStore.updateProgress(deviceAssetId, loaded, total),
+        });
+      } catch (error) {
+        // A cancelled upload (logout, or the user aborting) should not leave its bytes parked on
+        // the server until the session expires a week later.
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          await cancelResumableUpload(assetFile, checksum, metadata, queryParams);
+        }
+
+        throw error;
+      }
     }
 
     if (!responseData) {
