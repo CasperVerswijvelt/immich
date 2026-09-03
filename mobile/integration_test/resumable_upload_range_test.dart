@@ -32,6 +32,8 @@ void main() {
 
   setUp(() async {
     received.clear();
+    // a running total per session, so Upload-Offset is a real cumulative offset like the server's
+    final committed = <String, int>{};
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     endpoint = 'http://${server.address.host}:${server.port}';
 
@@ -58,10 +60,13 @@ void main() {
               ),
             );
 
+            final offset = (committed[request.uri.path] ?? 0) + body.length;
+            committed[request.uri.path] = offset;
+
             request.response.statusCode = HttpStatus.noContent;
             // deliberately capitalised: parseUploadOffset looks up a lowercase key, so this is
             // what proves the plugin lowercases response headers as assumed
-            request.response.headers.set('Upload-Offset', '${body.length}');
+            request.response.headers.set('Upload-Offset', '$offset');
             await request.response.close();
           })
           .asFuture<void>()
