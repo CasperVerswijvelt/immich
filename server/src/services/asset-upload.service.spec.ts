@@ -1,11 +1,13 @@
 import { BadRequestException, HttpException, NotFoundException } from '@nestjs/common';
 import { Request } from 'express';
 import { createHash } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import { mkdtemp, readdir, readFile, rm, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { AssetMediaStatus } from 'src/dtos/asset-media-response.dto';
+import { CryptoRepository } from 'src/repositories/crypto.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { AssetMediaService } from 'src/services/asset-media.service';
@@ -67,7 +69,12 @@ describe(AssetUploadService.name, () => {
 
     assetMediaService = {
       canUploadFile: vitest.fn().mockReturnValue(true),
-      getUploadFolder: vitest.fn().mockReturnValue(folder),
+      // mirrors StorageCore.getNestedFolder: <upload>/<userId>/ab/cd
+      getUploadFolder: vitest.fn().mockImplementation(({ file }) => {
+        const nested = join(folder, 'user-id', file.uuid.slice(0, 2), file.uuid.slice(2, 4));
+        mkdirSync(nested, { recursive: true });
+        return nested;
+      }),
       getUploadFilename: vitest.fn().mockImplementation(({ file }) => `${file.uuid}.jpg`),
       uploadAsset: vitest.fn().mockResolvedValue({ id: 'asset-id', status: AssetMediaStatus.CREATED }),
     };
@@ -75,20 +82,35 @@ describe(AssetUploadService.name, () => {
     sut = new AssetUploadService(
       assetMediaService as unknown as AssetMediaService,
       new StorageRepository(logger),
+      new CryptoRepository(),
       logger,
     );
   });
 
   afterEach(() => rm(folder, { recursive: true, force: true }));
 
+  /** Where a session's files actually live, mirroring StorageCore's uuid-prefix nesting. */
+  const sessionDir = (id: string) => join(folder, 'user-id', id.slice(0, 2), id.slice(2, 4));
+
   describe('create', () => {
     it('should create an empty part file and a session sidecar', async () => {
       const { id, expiresAt } = await create();
 
-      const entries = await readdir(folder);
+      const entries = await readdir(sessionDir(id));
       expect(entries.sort()).toEqual([`${id}.jpg.part`, `${id}.json`]);
-      expect(await readFile(join(folder, `${id}.jpg.part`))).toHaveLength(0);
+      expect(await readFile(join(sessionDir(id), `${id}.jpg.part`))).toHaveLength(0);
       expect(Date.parse(expiresAt)).toBeGreaterThan(Date.now());
+    });
+
+    it('should reject metadata that fails dto validation before writing anything', async () => {
+      // validated at creation rather than at finalize, so a bad value costs no upload
+      await expect(create(payload.length, checksum, { filename: 'example.jpg' })).rejects.toThrow(BadRequestException);
+      await expect(readdir(folder)).resolves.toEqual([]);
+    });
+
+    it('should reject a checksum that is not a sha1 digest', async () => {
+      await expect(create(payload.length, 'not-a-digest')).rejects.toThrow(BadRequestException);
+      await expect(readdir(folder)).resolves.toEqual([]);
     });
 
     it('should reject metadata without a filename', async () => {
@@ -107,12 +129,44 @@ describe(AssetUploadService.name, () => {
     it('should sweep an expired session belonging to the same user', async () => {
       const { id: stale } = await create();
       const expired = new Date(Date.now() - UPLOAD_EXPIRY_MS - 1000);
-      await utimes(join(folder, `${stale}.jpg.part`), expired, expired);
+      await utimes(join(sessionDir(stale), `${stale}.jpg.part`), expired, expired);
 
       const { id: fresh } = await create();
 
-      const remaining = await readdir(folder);
+      // the stale session's files are gone (the empty bucket dir is left behind), and the fresh
+      // session survives - a sweep that took both would silently destroy concurrent uploads
+      await expect(readdir(sessionDir(stale))).resolves.toEqual([]);
+      const remaining = await readdir(sessionDir(fresh));
       expect(remaining.sort()).toEqual([`${fresh}.jpg.part`, `${fresh}.json`]);
+    });
+
+    it('should keep two live sessions independent', async () => {
+      // a sign error in the sweep's cutoff would delete every .part file in the user's tree and
+      // still pass the expiry test above, silently destroying a concurrent upload
+      const { id: first } = await create();
+      await sut.patch(auth, first, 0, body(payload.subarray(0, 10)));
+      const { id: second } = await create();
+
+      await expect(sut.getState(auth, first)).resolves.toMatchObject({ offset: 10 });
+      await expect(sut.getState(auth, second)).resolves.toMatchObject({ offset: 0 });
+    });
+
+    it('should set an expiry matching the configured window', async () => {
+      const before = Date.now();
+      const { expiresAt } = await create();
+
+      const window = Date.parse(expiresAt) - before;
+      expect(window).toBeGreaterThan(UPLOAD_EXPIRY_MS - 5000);
+      expect(window).toBeLessThanOrEqual(UPLOAD_EXPIRY_MS + 5000);
+    });
+
+    it('should still create a session when the sweep cannot read the folder', async () => {
+      // an opportunistic sweep must never be able to break uploading
+      const readdirWithTypes = vitest.spyOn(StorageRepository.prototype, 'readdirWithTypes');
+      readdirWithTypes.mockRejectedValueOnce(new Error('EIO'));
+
+      await expect(create()).resolves.toMatchObject({ id: expect.any(String) });
+      readdirWithTypes.mockRestore();
     });
   });
 
@@ -145,14 +199,34 @@ describe(AssetUploadService.name, () => {
         auth,
         expect.objectContaining({ filename: 'example.jpg' }),
         expect.objectContaining({
-          originalPath: join(folder, `${id}.jpg`),
+          originalPath: join(sessionDir(id), `${id}.jpg`),
           originalName: 'example.jpg',
           size: payload.length,
           checksum: Buffer.from(checksum, 'hex'),
         }),
         undefined,
       );
-      await expect(readdir(folder)).resolves.toEqual([`${id}.jpg`]);
+      await expect(readdir(sessionDir(id))).resolves.toEqual([`${id}.jpg`]);
+    });
+
+    it('should serialise concurrent patches on one session', async () => {
+      // without the per-upload lock both would read offset 0 and write over each other
+      const { id } = await create();
+      const first = payload.subarray(0, 20);
+      const second = payload.subarray(20);
+
+      const results = await Promise.allSettled([
+        sut.patch(auth, id, 0, body(first)),
+        sut.patch(auth, id, 0, body(second)),
+      ]);
+
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const rejected = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toBeInstanceOf(UploadOffsetConflict);
+
+      // exactly one chunk landed, not an interleaving of both
+      await expect(readFile(join(sessionDir(id), `${id}.jpg.part`))).resolves.toEqual(first);
     });
 
     it('should conflict on a stale offset and report the authoritative one', async () => {
@@ -196,7 +270,7 @@ describe(AssetUploadService.name, () => {
 
       const resumed = await sut.patch(auth, id, 12, body(payload.subarray(12)));
       expect(resumed.asset).toEqual({ id: 'asset-id', status: AssetMediaStatus.CREATED });
-      await expect(readFile(join(folder, `${id}.jpg`))).resolves.toEqual(payload);
+      await expect(readFile(join(sessionDir(id), `${id}.jpg`))).resolves.toEqual(payload);
     });
 
     it('should reject a completed upload whose bytes do not match the declared checksum', async () => {
@@ -204,14 +278,7 @@ describe(AssetUploadService.name, () => {
 
       await expect(sut.patch(auth, id, 0, body(payload))).rejects.toMatchObject({ status: 460 });
       expect(assetMediaService.uploadAsset).not.toHaveBeenCalled();
-      await expect(readdir(folder)).resolves.toEqual([]);
-    });
-
-    it('should reject metadata that fails dto validation, after the bytes arrive', async () => {
-      const { id } = await create(payload.length, checksum, { filename: 'example.jpg' });
-
-      await expect(sut.patch(auth, id, 0, body(payload))).rejects.toThrow(BadRequestException);
-      await expect(readdir(folder)).resolves.toEqual([]);
+      await expect(readdir(sessionDir(id))).resolves.toEqual([]);
     });
 
     it('should accept a base64 checksum as well as hex', async () => {
@@ -242,9 +309,9 @@ describe(AssetUploadService.name, () => {
         auth,
         expect.anything(),
         expect.anything(),
-        expect.objectContaining({ originalPath: join(folder, `${id}.xmp`) }),
+        expect.objectContaining({ originalPath: join(sessionDir(id), `${id}.xmp`) }),
       );
-      await expect(readFile(join(folder, `${id}.xmp`), 'utf8')).resolves.toBe('<x:xmpmeta/>');
+      await expect(readFile(join(sessionDir(id), `${id}.xmp`), 'utf8')).resolves.toBe('<x:xmpmeta/>');
     });
 
     it('should not pass a sidecar when none was uploaded', async () => {
@@ -274,7 +341,7 @@ describe(AssetUploadService.name, () => {
 
       await sut.delete(auth, id);
 
-      await expect(readdir(folder)).resolves.toEqual([]);
+      await expect(readdir(sessionDir(id))).resolves.toEqual([]);
     });
   });
 
@@ -284,7 +351,7 @@ describe(AssetUploadService.name, () => {
 
       await sut.delete(auth, id);
 
-      await expect(readdir(folder)).resolves.toEqual([]);
+      await expect(readdir(sessionDir(id))).resolves.toEqual([]);
       await expect(sut.getState(auth, id)).rejects.toThrow(NotFoundException);
     });
 

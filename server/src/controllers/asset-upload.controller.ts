@@ -23,7 +23,15 @@ import { ImmichHeader, Permission } from 'src/enum';
 import { AssetUploadInterceptor } from 'src/middleware/asset-upload.interceptor';
 import { Auth, Authenticated } from 'src/middleware/auth.guard';
 import { AssetUploadService, SIDECAR_MAX_SIZE, UploadOffsetConflict } from 'src/services/asset-upload.service';
-import { getHeader, parseNonNegativeInt, parseUploadMetadata, TUS_EXTENSIONS, TUS_VERSION } from 'src/utils/tus';
+import { fromMaybeArray } from 'src/utils/request';
+import {
+  parseNonNegativeInt,
+  parseUploadMetadata,
+  TUS_EXTENSIONS,
+  TUS_OFFSET_CONTENT_TYPE,
+  TUS_VERSION,
+} from 'src/utils/tus';
+import { UUIDParamDto } from 'src/validation';
 
 /**
  * Resumable uploads, tus 1.0.0 (https://tus.io/protocols/resumable-upload) with the `creation`,
@@ -63,12 +71,12 @@ export class AssetUploadController {
       throw new BadRequestException('Upload-Length must be a positive integer');
     }
 
-    const checksum = getHeader(req.headers, ImmichHeader.Checksum);
+    const checksum = fromMaybeArray(req.headers[ImmichHeader.Checksum]);
     if (!checksum) {
       throw new BadRequestException(`${ImmichHeader.Checksum} is required for resumable uploads`);
     }
 
-    const metadata = parseUploadMetadata(getHeader(req.headers, 'upload-metadata'));
+    const metadata = parseUploadMetadata(fromMaybeArray(req.headers['upload-metadata']));
     if (!metadata) {
       throw new BadRequestException('Upload-Metadata is malformed');
     }
@@ -80,20 +88,20 @@ export class AssetUploadController {
       // req.path, not req.baseUrl: Nest registers routes straight onto express, so there is no
       // mounted router and baseUrl is empty.
       Location: `${req.path.replace(/\/$/, '')}/${id}`,
-      'Upload-Expires': expiresAt,
+      'Upload-Expires': new Date(expiresAt).toUTCString(),
     });
   }
 
   @Head(':id')
   @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
-  async status(@Auth() auth: AuthDto, @Param('id') id: string, @Res({ passthrough: true }) res: Response) {
+  async status(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto, @Res({ passthrough: true }) res: Response) {
     const { offset, session } = await this.service.getState(auth, id);
 
     res.set({
       'Tus-Resumable': TUS_VERSION,
       'Upload-Offset': String(offset),
       'Upload-Length': String(session.uploadLength),
-      'Upload-Expires': session.expiresAt,
+      'Upload-Expires': new Date(session.expiresAt).toUTCString(),
       'Cache-Control': 'no-store',
     });
   }
@@ -102,12 +110,12 @@ export class AssetUploadController {
   @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
   async append(
     @Auth() auth: AuthDto,
-    @Param('id') id: string,
+    @Param() { id }: UUIDParamDto,
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
-    if (req.headers['content-type'] !== 'application/offset+octet-stream') {
-      throw new BadRequestException('Content-Type must be application/offset+octet-stream');
+    if (req.headers['content-type'] !== TUS_OFFSET_CONTENT_TYPE) {
+      throw new BadRequestException(`Content-Type must be ${TUS_OFFSET_CONTENT_TYPE}`);
     }
 
     const claimedOffset = parseNonNegativeInt(req.headers['upload-offset']);
@@ -142,14 +150,23 @@ export class AssetUploadController {
   @Put(':id/sidecar')
   @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
   @HttpCode(HttpStatus.NO_CONTENT)
-  async sidecar(@Auth() auth: AuthDto, @Param('id') id: string, @Req() req: Request) {
+  async sidecar(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto, @Req() req: Request) {
+    // body-parser only skips bodies whose content type it does not handle, so a client sending
+    // application/json would have its sidecar consumed before it reaches here
+    const contentType = fromMaybeArray(req.headers['content-type']);
+    if (contentType && /^application\/(json|x-www-form-urlencoded)/.test(contentType)) {
+      throw new BadRequestException('Sidecar must not be sent as JSON or form data');
+    }
+
+    // resolve the session before buffering, so an unknown id cannot cost us a megabyte
+    await this.service.getState(auth, id);
     await this.service.putSidecar(auth, id, await readBody(req, SIDECAR_MAX_SIZE));
   }
 
   @Delete(':id')
   @Authenticated({ permission: Permission.AssetUpload, sharedLink: true })
   @HttpCode(HttpStatus.NO_CONTENT)
-  async terminate(@Auth() auth: AuthDto, @Param('id') id: string, @Res({ passthrough: true }) res: Response) {
+  async terminate(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto, @Res({ passthrough: true }) res: Response) {
     await this.service.delete(auth, id);
     res.set({ 'Tus-Resumable': TUS_VERSION });
   }

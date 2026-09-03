@@ -1,13 +1,22 @@
-import { BadRequestException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  HttpException,
+  Injectable,
+  NotFoundException,
+  PayloadTooLargeException,
+} from '@nestjs/common';
 import AsyncLock from 'async-lock';
 import { Request } from 'express';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { dirname, join } from 'node:path';
-import { finished, pipeline } from 'node:stream/promises';
+import { dirname, join, parse } from 'node:path';
+import { finished } from 'node:stream/promises';
 import { AssetMediaResponseDto } from 'src/dtos/asset-media-response.dto';
 import { AssetMediaCreateDto, UploadFieldName } from 'src/dtos/asset-media.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
+import { ImmichHeader } from 'src/enum';
+import { CryptoRepository } from 'src/repositories/crypto.repository';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import { StorageRepository } from 'src/repositories/storage.repository';
 import { AssetMediaService } from 'src/services/asset-media.service';
@@ -21,6 +30,9 @@ const CHECKSUM_MISMATCH = 460;
 
 /** XMP sidecars are metadata, not media. Anything near this size is not a sidecar. */
 export const SIDECAR_MAX_SIZE = 1024 * 1024;
+
+/** A sha1 digest, so a checksum that decodes to anything else can never match. */
+const SHA1_BYTES = 20;
 
 interface UploadSession {
   uploadLength: number;
@@ -38,9 +50,9 @@ interface UploadState {
 }
 
 /** 409 carrying the authoritative offset, so the client can resume without re-probing. */
-export class UploadOffsetConflict extends HttpException {
+export class UploadOffsetConflict extends ConflictException {
   constructor(public offset: number) {
-    super('Upload-Offset does not match the current offset', 409);
+    super('Upload-Offset does not match the current offset');
   }
 }
 
@@ -55,6 +67,7 @@ export class AssetUploadService {
   constructor(
     private assetMediaService: AssetMediaService,
     private storageRepository: StorageRepository,
+    private cryptoRepository: CryptoRepository,
     private logger: LoggingRepository,
   ) {
     this.logger.setContext(AssetUploadService.name);
@@ -70,6 +83,17 @@ export class AssetUploadService {
       throw new BadRequestException('Upload-Metadata must include a filename');
     }
 
+    // Both of these are knowable now, and both cause the finished upload to be discarded, so
+    // failing here saves the client a full re-upload and the server a full write plus a sha1 pass.
+    if (fromChecksum(checksum).length !== SHA1_BYTES) {
+      throw new BadRequestException(`${ImmichHeader.Checksum} must be a hex or base64 encoded sha1 digest`);
+    }
+
+    const metadataResult = AssetMediaCreateDto.schema.safeParse(metadata);
+    if (!metadataResult.success) {
+      throw new BadRequestException(formatZodIssues(metadataResult.error.issues));
+    }
+
     const uuid = randomUUID();
     const request = this.asUploadRequest(auth, uuid, filename);
 
@@ -77,7 +101,9 @@ export class AssetUploadService {
     this.requireQuota(auth, uploadLength);
 
     const folder = this.assetMediaService.getUploadFolder(request);
-    await this.sweepExpired(folder);
+    // `<upload>/<userId>/ab/cd` -> `<upload>/<userId>`, derived rather than recomputed so this
+    // stays independent of the configured media location
+    await this.sweepExpired(dirname(dirname(folder)));
 
     const session: UploadSession = {
       uploadLength,
@@ -105,8 +131,6 @@ export class AssetUploadService {
     const folder = this.assetMediaService.getUploadFolder(this.asUploadRequest(auth, id, ''));
     const jsonPath = join(folder, `${id}.json`);
 
-    let session: UploadSession;
-    let partPath: string;
     try {
       const entries = await this.storageRepository.readdir(folder);
       const part = entries.find((entry) => entry.startsWith(id) && entry.endsWith(PART_SUFFIX));
@@ -114,14 +138,21 @@ export class AssetUploadService {
         throw new NotFoundException();
       }
 
-      partPath = join(folder, part);
-      session = await this.storageRepository.readJsonFile<UploadSession>(jsonPath);
-    } catch {
+      const partPath = join(folder, part);
+      const session = await this.storageRepository.readJsonFile<UploadSession>(jsonPath);
+      const { size } = await this.storageRepository.stat(partPath);
+
+      return { session, partPath, jsonPath, offset: size };
+    } catch (error) {
+      // A missing session is a 404, but EACCES, EIO or a truncated session file are faults worth
+      // seeing in the logs rather than silently telling the client to start over.
+      if (error instanceof NotFoundException || (error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new NotFoundException();
+      }
+
+      this.logger.warn(`Failed to load resumable upload ${id}: ${error}`);
       throw new NotFoundException();
     }
-
-    const { size } = await this.storageRepository.stat(partPath);
-    return { session, partPath, jsonPath, offset: size };
   }
 
   /**
@@ -166,8 +197,11 @@ export class AssetUploadService {
   }
 
   async delete(auth: AuthDto, id: string) {
-    const { partPath, jsonPath } = await this.getState(auth, id);
-    await this.discard(partPath, jsonPath);
+    // same lock as patch(): unlinking underneath an in-flight append would fail its writes
+    await this.lock.acquire(id, async () => {
+      const { partPath, jsonPath } = await this.getState(auth, id);
+      await this.discard(partPath, jsonPath);
+    });
   }
 
   /**
@@ -175,12 +209,16 @@ export class AssetUploadService {
    * rather than getting a resumable session of their own; finalize picks the file up if present.
    */
   async putSidecar(auth: AuthDto, id: string, sidecar: Buffer) {
-    const { partPath } = await this.getState(auth, id);
     if (sidecar.length === 0 || sidecar.length > SIDECAR_MAX_SIZE) {
       throw new BadRequestException(`Sidecar must be between 1 and ${SIDECAR_MAX_SIZE} bytes`);
     }
 
-    await this.storageRepository.createOrOverwriteFile(sidecarPathFor(partPath), sidecar);
+    // under the lock so it cannot land after finalize has already checked for it, which would
+    // leave an orphaned .xmp attached to nothing
+    await this.lock.acquire(id, async () => {
+      const { partPath } = await this.getState(auth, id);
+      await this.storageRepository.createOrOverwriteFile(sidecarPathFor(partPath), sidecar);
+    });
   }
 
   /**
@@ -196,6 +234,11 @@ export class AssetUploadService {
     let written = 0;
     let tooLarge = false;
 
+    // A bare fs stream with no 'error' listener turns any write failure - ENOSPC, EIO, or an
+    // ENOENT open if the session is deleted concurrently - into an uncaughtException, which kills
+    // the whole API worker rather than this one request. The error is re-thrown by finished() below.
+    destination.on('error', () => {});
+
     try {
       for await (const chunk of req as AsyncIterable<Buffer>) {
         // Content-Length is not trusted; chunked transfer-encoding bypasses it, so count real bytes
@@ -206,6 +249,11 @@ export class AssetUploadService {
 
         written += chunk.length;
         if (!destination.write(chunk)) {
+          // a destroyed stream never emits 'drain', so awaiting it here would hang holding the lock
+          if (destination.errored || destination.destroyed) {
+            break;
+          }
+
           await once(destination, 'drain');
         }
       }
@@ -214,16 +262,21 @@ export class AssetUploadService {
       // reports the true offset, so the client resumes from there.
       this.logger.debug(`Resumable upload ${id} interrupted after ${written} bytes: ${error}`);
     } finally {
+      // rejects with the real write error if there was one, so a failed write is never reported
+      // back as a successful offset
       await finished(destination.end());
     }
 
     if (tooLarge) {
-      throw new HttpException('Upload exceeds the declared Upload-Length', 413);
+      // the response is sent without reading the rest of the body, so drop the connection rather
+      // than leaving Node to reset it mid-response
+      req.destroy();
+      throw new PayloadTooLargeException('Upload exceeds the declared Upload-Length');
     }
   }
 
   private async finalize(auth: AuthDto, session: UploadSession, partPath: string, jsonPath: string) {
-    const checksum = await this.sha1(partPath);
+    const checksum = await this.cryptoRepository.hashFile(partPath);
     if (!checksum.equals(fromChecksum(session.checksum))) {
       await this.discard(partPath, jsonPath);
       throw new HttpException('Checksum mismatch', CHECKSUM_MISMATCH);
@@ -234,7 +287,7 @@ export class AssetUploadService {
     const parsed = AssetMediaCreateDto.schema.safeParse(session.metadata);
     if (!parsed.success) {
       await this.discard(partPath, jsonPath);
-      throw new BadRequestException(parsed.error.issues.map(({ path, message }) => `${path.join('.')}: ${message}`));
+      throw new BadRequestException(formatZodIssues(parsed.error.issues));
     }
 
     // must precede uploadAsset, which stores originalPath verbatim and derives the type from it
@@ -264,51 +317,60 @@ export class AssetUploadService {
     }
   }
 
-  private async sha1(filepath: string) {
-    const hash = createHash('sha1');
-    await pipeline(this.storageRepository.createPlainReadStream(filepath), hash);
-    return hash.digest();
-  }
-
   private async discard(partPath: string, jsonPath: string) {
     const sidecarPath = sidecarPathFor(partPath);
     await Promise.all([
       this.storageRepository.unlink(partPath),
       this.storageRepository.unlink(jsonPath),
-      this.unlinkIfExists(sidecarPath),
+      this.storageRepository.unlink(sidecarPath),
     ]);
   }
 
-  private async unlinkIfExists(filepath: string) {
-    if (await this.storageRepository.checkFileExists(filepath)) {
-      await this.storageRepository.unlink(filepath);
-    }
-  }
-
   /**
-   * ponytail: cleanup is opportunistic at session creation, scoped to the creating user's folder.
+   * ponytail: cleanup is opportunistic at session creation, scoped to the creating user's tree.
    * Ceiling: a user who stops uploading forever leaves their partials behind (invisible to the
    * integrity crawler, since `.part` is not a supported extension).
    * Upgrade path when upstreaming: JobName.AssetUploadCleanup in QueueService.handleNightlyJobs,
    * guarded by a new DatabaseLock, exactly like HlsSessionCleanup.
    */
-  private async sweepExpired(folder: string) {
+  private async sweepExpired(userFolder: string) {
     try {
       const cutoff = Date.now() - UPLOAD_EXPIRY_MS;
-      for (const entry of await this.storageRepository.readdir(folder)) {
-        if (!entry.endsWith(PART_SUFFIX)) {
+
+      // Sessions are nested two levels deep by uuid prefix, so the user's whole tree has to be
+      // walked. Sweeping only the new session's own bucket would inspect 1 of 65536 directories,
+      // which is what an earlier version of this did - the cleanup never actually ran.
+      for (const bucket of await this.storageRepository.readdirWithTypes(userFolder)) {
+        if (!bucket.isDirectory()) {
           continue;
         }
 
-        const partPath = join(folder, entry);
-        const { mtimeMs } = await this.storageRepository.stat(partPath);
-        if (mtimeMs < cutoff) {
-          this.logger.debug(`Sweeping expired resumable upload ${partPath}`);
-          await this.discard(partPath, join(folder, `${uuidOf(partPath.slice(0, -PART_SUFFIX.length))}.json`));
+        const bucketPath = join(userFolder, bucket.name);
+        for (const nested of await this.storageRepository.readdirWithTypes(bucketPath)) {
+          if (!nested.isDirectory()) {
+            continue;
+          }
+
+          await this.sweepFolder(join(bucketPath, nested.name), cutoff);
         }
       }
     } catch (error) {
-      this.logger.warn(`Failed to sweep expired uploads in ${folder}: ${error}`);
+      this.logger.warn(`Failed to sweep expired uploads in ${userFolder}: ${error}`);
+    }
+  }
+
+  private async sweepFolder(folder: string, cutoff: number) {
+    for (const entry of await this.storageRepository.readdir(folder)) {
+      if (!entry.endsWith(PART_SUFFIX)) {
+        continue;
+      }
+
+      const partPath = join(folder, entry);
+      const { mtimeMs } = await this.storageRepository.stat(partPath);
+      if (mtimeMs < cutoff) {
+        this.logger.debug(`Sweeping expired resumable upload ${partPath}`);
+        await this.discard(partPath, join(folder, `${uuidOf(partPath.slice(0, -PART_SUFFIX.length))}.json`));
+      }
     }
   }
 
@@ -330,7 +392,10 @@ export class AssetUploadService {
   }
 }
 
-const uuidOf = (filepath: string) => (filepath.split('/').pop() ?? filepath).replace(/\.[^.]*$/, '');
+const uuidOf = (filepath: string) => parse(filepath).name;
+
+const formatZodIssues = (issues: { path: PropertyKey[]; message: string }[]) =>
+  issues.map(({ path, message }) => `${path.join('.')}: ${message}`);
 
 /**
  * `<uuid>.xmp` beside the media file, matching what getUploadFilename produces for the multipart

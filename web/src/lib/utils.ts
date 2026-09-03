@@ -29,6 +29,7 @@ import { alwaysLoadOriginalFile, lang } from '$lib/stores/preferences.store';
 import { isWebCompatibleImage } from '$lib/utils/asset-utils';
 import { handleError } from '$lib/utils/handle-error';
 import { convertBCP47, langs } from '$lib/utils/i18n';
+import { trackUpload } from '$lib/utils/upload-registry';
 
 interface DownloadRequestOptions<T = unknown> {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
@@ -76,25 +77,10 @@ class ApiError extends Error {
   }
 }
 
+export { cancelUploadRequests } from '$lib/utils/upload-registry';
+
 export const sleep = (ms: number) => {
   return new Promise((resolve) => setTimeout(resolve, ms));
-};
-
-let unsubscribeId = 0;
-const uploads: Record<number, () => void> = {};
-
-const trackUpload = (unsubscribe: () => void) => {
-  const id = unsubscribeId++;
-  uploads[id] = unsubscribe;
-  return () => {
-    delete uploads[id];
-  };
-};
-
-export const cancelUploadRequests = () => {
-  for (const unsubscribe of Object.values(uploads)) {
-    unsubscribe();
-  }
 };
 
 export const uploadRequest = async <T>(options: UploadRequestOptions): Promise<{ data: T; status: number }> => {

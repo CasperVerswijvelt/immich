@@ -10,7 +10,7 @@ type Exchange = {
   bodyLength: number;
 };
 
-type Reply = { status: number; headers?: Record<string, string>; body?: unknown };
+type Reply = { status: number; headers?: Record<string, string>; body?: unknown } | { fail: true };
 
 /**
  * A fake XMLHttpRequest that records every exchange and replies from a scripted queue, so the
@@ -53,6 +53,11 @@ const installXhr = (replies: Reply[]) => {
       return this.replyHeaders[name] ?? null;
     }
 
+    abort() {
+      this.status = 0;
+      this.listeners.abort?.();
+    }
+
     send(body?: Blob) {
       const reply = replies[index++] ?? { status: 500 };
       exchanges.push({
@@ -61,6 +66,12 @@ const installXhr = (replies: Reply[]) => {
         headers: { ...this.headers },
         bodyLength: body?.size ?? 0,
       });
+
+      // a transport failure fires 'error', not 'load' - the distinction the retry logic turns on
+      if ('fail' in reply) {
+        this.listeners.error?.();
+        return;
+      }
 
       this.status = reply.status;
       this.response = reply.body;
@@ -78,6 +89,10 @@ const fileOf = (size: number, name = 'video.mp4') =>
   new File([new Uint8Array(size)], name, { lastModified: 0, type: 'video/mp4' });
 
 const metadata = { fileCreatedAt: '2026-01-01T00:00:00.000Z', fileModifiedAt: '2026-01-01T00:00:00.000Z' };
+
+/** Mirrors the module's key, which covers the metadata so a resume cannot apply the wrong one. */
+const keyFor = (checksum: string, filename = 'video.mp4') =>
+  `immich:upload:${checksum}:${JSON.stringify({ ...metadata, filename })}`;
 const created = { id: 'asset-id', status: 'created' };
 
 describe('shouldUseResumableUpload', () => {
@@ -188,7 +203,7 @@ describe('resumableUpload', () => {
   });
 
   it('should resume a remembered session with a HEAD instead of creating a new one', async () => {
-    localStorage.setItem('immich:upload:abc123', '/api/assets/upload/abc');
+    localStorage.setItem(keyFor('abc123'), '/api/assets/upload/abc');
     const exchanges = installXhr([
       { status: 200, headers: { 'Upload-Offset': '600' } },
       { status: 201, body: created },
@@ -201,7 +216,7 @@ describe('resumableUpload', () => {
   });
 
   it('should discard a remembered session the server no longer knows about', async () => {
-    localStorage.setItem('immich:upload:abc123', '/api/assets/upload/gone');
+    localStorage.setItem(keyFor('abc123'), '/api/assets/upload/gone');
     const exchanges = installXhr([
       { status: 404 },
       { status: 201, headers: { Location: '/api/assets/upload/new' } },
@@ -210,7 +225,7 @@ describe('resumableUpload', () => {
 
     await expect(resumableUpload({ file: fileOf(1000), checksum: 'abc123', metadata })).resolves.toEqual(created);
     expect(exchanges[1]).toMatchObject({ method: 'POST' });
-    expect(localStorage.getItem('immich:upload:abc123')).toBeNull();
+    expect(localStorage.getItem(keyFor('abc123'))).toBeNull();
   });
 
   it('should forget the session once the upload completes', async () => {
@@ -221,7 +236,125 @@ describe('resumableUpload', () => {
 
     await resumableUpload({ file: fileOf(1000), checksum: 'abc123', metadata });
 
-    expect(localStorage.getItem('immich:upload:abc123')).toBeNull();
+    expect(localStorage.getItem(keyFor('abc123'))).toBeNull();
+  });
+
+  it('should not resume a session created with different metadata', async () => {
+    // the session is finalized with the metadata it was created with, so reusing it for a
+    // different visibility or filename would apply the wrong one
+    localStorage.setItem(keyFor('abc123'), '/api/assets/upload/abc');
+    const exchanges = installXhr([
+      { status: 201, headers: { Location: '/api/assets/upload/new' } },
+      { status: 201, body: created },
+    ]);
+
+    await resumableUpload({
+      file: fileOf(1000),
+      checksum: 'abc123',
+      metadata: { ...metadata, visibility: 'locked' },
+    });
+
+    // a fresh session, not a HEAD of the remembered one
+    expect(exchanges[0].method).toBe('POST');
+  });
+
+  it('should give up rather than re-sending a chunk the server never advanced past', async () => {
+    const exchanges = installXhr([
+      { status: 201, headers: { Location: '/api/assets/upload/abc' } },
+      { status: 204, headers: { 'Upload-Offset': '0' } },
+    ]);
+
+    await expect(
+      resumableUpload({ file: fileOf(3000), checksum: 'abc123', metadata, chunkSize: 1000 }),
+    ).rejects.toThrow(/did not advance/);
+    expect(exchanges).toHaveLength(2);
+  });
+
+  it('should give up when a 204 reports a non-numeric offset', async () => {
+    installXhr([
+      { status: 201, headers: { Location: '/api/assets/upload/abc' } },
+      { status: 204, headers: { 'Upload-Offset': 'banana' } },
+    ]);
+
+    await expect(
+      resumableUpload({ file: fileOf(3000), checksum: 'abc123', metadata, chunkSize: 1000 }),
+    ).rejects.toThrow(/did not advance/);
+  });
+
+  it('should halve the chunk size after a transport failure', async () => {
+    const exchanges = installXhr([
+      { status: 201, headers: { Location: '/api/assets/upload/abc' } },
+      { fail: true },
+      { status: 201, body: created },
+    ]);
+
+    await expect(
+      resumableUpload({ file: fileOf(3 * 1024 * 1024), checksum: 'abc123', metadata, chunkSize: 4 * 1024 * 1024 }),
+    ).resolves.toEqual(created);
+
+    // retried at the same offset with half the bytes
+    expect(exchanges[2].headers['Upload-Offset']).toBe('0');
+    expect(exchanges[1].bodyLength).toBe(3 * 1024 * 1024);
+    expect(exchanges[2].bodyLength).toBe(2 * 1024 * 1024);
+  });
+
+  it('should halve the chunk size when a proxy rejects the chunk as too large', async () => {
+    const exchanges = installXhr([
+      { status: 201, headers: { Location: '/api/assets/upload/abc' } },
+      { status: 413 },
+      { status: 201, body: created },
+    ]);
+
+    await expect(
+      resumableUpload({ file: fileOf(3 * 1024 * 1024), checksum: 'abc123', metadata, chunkSize: 4 * 1024 * 1024 }),
+    ).resolves.toEqual(created);
+    expect(exchanges[2].bodyLength).toBe(2 * 1024 * 1024);
+  });
+
+  it('should stop halving at the floor rather than looping forever', async () => {
+    const exchanges = installXhr([
+      { status: 201, headers: { Location: '/api/assets/upload/abc' } },
+      { fail: true },
+      { fail: true },
+    ]);
+
+    await expect(
+      resumableUpload({ file: fileOf(3 * 1024 * 1024), checksum: 'abc123', metadata, chunkSize: 1024 * 1024 }),
+    ).rejects.toThrow();
+    // create + one attempt at the floor, then it gives up
+    expect(exchanges).toHaveLength(2);
+  });
+
+  it('should abort when the signal is already aborted', async () => {
+    const exchanges = installXhr([{ status: 201, headers: { Location: '/api/assets/upload/abc' } }]);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      resumableUpload({ file: fileOf(1000), checksum: 'abc123', metadata, signal: controller.signal }),
+    ).rejects.toThrow(/abort/i);
+    expect(exchanges).toHaveLength(0);
+  });
+
+  it('should not let progress regress when the server commits less than was sent', async () => {
+    installXhr([
+      { status: 201, headers: { Location: '/api/assets/upload/abc' } },
+      { status: 204, headers: { 'Upload-Offset': '600' } },
+      { status: 201, body: created },
+    ]);
+
+    const seen: number[] = [];
+    await resumableUpload({
+      file: fileOf(2000),
+      checksum: 'abc123',
+      metadata,
+      chunkSize: 1000,
+      onProgress: (loaded) => void seen.push(loaded),
+    });
+
+    // optimistically reported 1000, the server only committed 600; the bar must not go back
+    expect(seen).toEqual([...seen].sort((a, b) => a - b));
+    expect(seen.at(-1)).toBe(2000);
   });
 
   it('should append shared-link query params to every request', async () => {
