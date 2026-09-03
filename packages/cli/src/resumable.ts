@@ -1,3 +1,4 @@
+import { AssetMediaResponseDto } from '@immich/sdk';
 import { createReadStream } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
@@ -47,8 +48,8 @@ export type ResumableUploadOptions = {
  * the single-request endpoint. Attempting the creation request is the capability probe: a
  * dedicated OPTIONS probe is answered by CORS middleware on dev servers before it reaches the route.
  */
-export const resumableUpload = async (options: ResumableUploadOptions): Promise<unknown | undefined> => {
-  const { baseUrl, headers, filepath, size, filename, checksum, metadata } = options;
+export const resumableUpload = async (options: ResumableUploadOptions): Promise<AssetMediaResponseDto | undefined> => {
+  const { baseUrl, headers, size, filename, checksum, metadata } = options;
 
   const created = await fetch(`${baseUrl}/assets/upload`, {
     method: 'POST',
@@ -68,7 +69,7 @@ export const resumableUpload = async (options: ResumableUploadOptions): Promise<
 
   // the server recognised the checksum, so nothing needs uploading at all
   if (created.status === 200) {
-    return created.json();
+    return created.json() as Promise<AssetMediaResponseDto>;
   }
 
   const location = created.headers.get('location');
@@ -77,6 +78,32 @@ export const resumableUpload = async (options: ResumableUploadOptions): Promise<
   }
 
   const url = new URL(location, baseUrl).href;
+
+  try {
+    return await send(url, options);
+  } catch (error) {
+    // Without this a file that fails its 3 retries leaves 3 multi-GB .part files on the server,
+    // reclaimed only by the 7-day sweep.
+    await terminate(url, headers);
+    throw error;
+  }
+};
+
+/** Abandon a session so its bytes are not left on disk until they expire. */
+const terminate = async (url: string, headers: Record<string, string>) => {
+  try {
+    await fetch(url, {
+      method: 'DELETE',
+      redirect: 'error',
+      headers: { ...headers, 'Tus-Resumable': TUS_VERSION },
+    });
+  } catch {
+    // best effort: the server's expiry sweep is the backstop
+  }
+};
+
+const send = async (url: string, options: ResumableUploadOptions) => {
+  const { headers, filepath, size } = options;
 
   if (options.sidecarPath) {
     // small enough for one request; the server attaches it at completion
@@ -123,14 +150,21 @@ export const resumableUpload = async (options: ResumableUploadOptions): Promise<
     }
 
     if (response.status === 200 || response.status === 201) {
-      return response.json();
+      return response.json() as Promise<AssetMediaResponseDto>;
     }
 
     if (response.status !== 204) {
       throw new Error(`Resumable upload failed: ${response.status} ${await response.text()}`);
     }
 
-    offset = Number(response.headers.get('upload-offset') ?? end);
+    // A 204 whose offset did not move means the chunk stored nothing; re-sending it forever is
+    // the loop the reverse-proxy docs warn about.
+    const next = Number(response.headers.get('upload-offset') ?? end);
+    if (!Number.isSafeInteger(next) || next <= offset) {
+      throw new Error('Resumable upload stalled: server offset did not advance');
+    }
+
+    offset = next;
   }
 
   throw new Error('Resumable upload finished without a response from the server');

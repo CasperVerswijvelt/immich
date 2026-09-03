@@ -59,6 +59,10 @@ abstract class UploadTaskMetadata with _$UploadTaskMetadata {
     /// Byte offset this chunk starts at, and the total size of the file.
     int? uploadOffset,
     int? uploadTotal,
+
+    /// Bumped for each queued chunk so task ids stay unique when a 409 sends the chain back to
+    /// an offset it has already used.
+    @Default(0) int attempt,
   }) = _UploadTaskMetadata;
 
   /// Whether this task is one chunk of a resumable upload rather than a whole-file request.
@@ -75,6 +79,7 @@ abstract class UploadTaskMetadata with _$UploadTaskMetadata {
       if (uploadUrl != null) 'uploadUrl': uploadUrl,
       if (uploadOffset != null) 'uploadOffset': uploadOffset,
       if (uploadTotal != null) 'uploadTotal': uploadTotal,
+      'attempt': attempt,
     };
   }
 
@@ -86,6 +91,7 @@ abstract class UploadTaskMetadata with _$UploadTaskMetadata {
       uploadUrl: map['uploadUrl'] as String?,
       uploadOffset: map['uploadOffset'] as int?,
       uploadTotal: map['uploadTotal'] as int?,
+      attempt: (map['attempt'] as int?) ?? 0,
     );
   }
 
@@ -216,19 +222,11 @@ class BackgroundUploadService {
         }
 
         unawaited(_handleLivePhoto(update));
-
-        if (CurrentPlatform.isIOS) {
-          try {
-            final path = await update.task.filePath();
-            await File(path).delete();
-          } catch (e) {
-            _logger.severe('Error deleting file path for iOS: $e');
-          }
-        }
+        await _deleteIosExport(update.task);
 
       case TaskStatus.failed:
         // A 409 means our offset was stale; the response carries the real one, so resume there
-        // rather than failing the whole asset.
+        // rather than failing the whole asset. Anything else is terminal.
         await _resumeFromServerOffset(update);
 
       default:
@@ -261,7 +259,17 @@ class BackgroundUploadService {
     final offset =
         parseUploadOffset(update.responseHeaders) ?? chunkRange(metadata.uploadOffset!, metadata.uploadTotal!).end;
 
-    await _enqueueChunkAt(update.task, metadata, offset);
+    // a 204 that did not advance would otherwise re-send the same slice forever, in the
+    // background, on cellular, with nothing surfaced to the user
+    if (offset <= metadata.uploadOffset!) {
+      await _abandonChunkedUpload(update.task, metadata, 'server offset did not advance');
+      return true;
+    }
+
+    if (!await _enqueueChunkAt(update.task, metadata, offset, attempt: metadata.attempt + 1)) {
+      await _abandonChunkedUpload(update.task, metadata, 'could not queue the next chunk');
+    }
+
     return true;
   }
 
@@ -271,19 +279,46 @@ class BackgroundUploadService {
       return;
     }
 
+    // Only a 409 carries a usable offset. A 413/460/400, an expired session or a dead network
+    // leaves nothing to resume from, and the chain has to end - otherwise the asset sits in
+    // silent limbo and the next backup run re-uploads it from byte 0, forever.
     final offset = parseUploadOffset(update.responseHeaders);
-    if (offset == null || offset == metadata.uploadOffset) {
-      _logger.warning("Resumable upload ${metadata.localAssetId} stalled at ${metadata.uploadOffset}");
+    if (offset == null || offset <= metadata.uploadOffset!) {
+      await _abandonChunkedUpload(update.task, metadata, 'server offset did not advance');
       return;
     }
 
     _logger.info("Resuming ${metadata.localAssetId} from the server's offset $offset");
-    await _enqueueChunkAt(update.task, metadata, offset);
+    if (!await _enqueueChunkAt(update.task, metadata, offset, attempt: metadata.attempt + 1)) {
+      await _abandonChunkedUpload(update.task, metadata, 'could not queue the next chunk');
+    }
   }
 
-  Future<void> _enqueueChunkAt(Task task, UploadTaskMetadata metadata, int offset) async {
-    if (offset >= metadata.uploadTotal!) {
+  /// End a chunked upload that cannot continue: drop the server session so its bytes are not left
+  /// on disk for a week, and clean up the iOS export the chain was holding.
+  Future<void> _abandonChunkedUpload(Task task, UploadTaskMetadata metadata, String reason) async {
+    _logger.warning("Abandoning resumable upload of ${metadata.localAssetId}: $reason");
+
+    await _uploadRepository.terminateResumableSession(Uri.parse(metadata.uploadUrl!));
+    await _deleteIosExport(task);
+  }
+
+  Future<void> _deleteIosExport(Task task) async {
+    if (!CurrentPlatform.isIOS) {
       return;
+    }
+
+    try {
+      await File(await task.filePath()).delete();
+    } catch (error) {
+      _logger.severe('Error deleting file path for iOS: $error');
+    }
+  }
+
+  /// Returns whether the next chunk was actually queued.
+  Future<bool> _enqueueChunkAt(Task task, UploadTaskMetadata metadata, int offset, {required int attempt}) async {
+    if (offset >= metadata.uploadTotal!) {
+      return true;
     }
 
     try {
@@ -294,15 +329,19 @@ class BackgroundUploadService {
         offset: offset,
         total: metadata.uploadTotal!,
         group: task.group,
-        metadata: metadata.copyWith(uploadOffset: offset).toJson(),
+        metadata: metadata.copyWith(uploadOffset: offset, attempt: attempt).toJson(),
         deviceAssetId: metadata.localAssetId,
         priority: task.priority,
         requiresWiFi: task.requiresWiFi,
+        attempt: attempt,
       );
 
-      await enqueueTasks([next]);
+      // the result matters: a rejected enqueue would otherwise strand the asset silently
+      final enqueued = await enqueueTasks([next]);
+      return enqueued.isNotEmpty && enqueued.every((ok) => ok);
     } catch (error, stackTrace) {
       _logger.severe(() => "Failed to queue the next upload chunk: $error", stackTrace);
+      return false;
     }
   }
 
@@ -495,12 +534,19 @@ class BackgroundUploadService {
         size: total,
         originalFileName: originalFileName,
         checksum: checksum,
-        fields: {
-          'fileCreatedAt': asset.createdAt.toUtc().toIso8601String(),
-          'fileModifiedAt': asset.updatedAt.toUtc().toIso8601String(),
-          'isFavorite': asset.isFavorite.toString(),
-          'duration': '0',
-        },
+        // the same fields the multipart task sends, including the iOS mobile-app metadata -
+        // omitting it here silently dropped cloudId/lat/long for every iOS asset over one chunk
+        fields: buildUploadFields(
+          createdAt: asset.createdAt,
+          modifiedAt: asset.updatedAt,
+          originalFileName: originalFileName,
+          deviceAssetId: asset.id,
+          isFavorite: asset.isFavorite,
+          cloudId: asset.cloudId,
+          adjustmentTime: asset.adjustmentTime?.toIso8601String(),
+          latitude: asset.latitude?.toString(),
+          longitude: asset.longitude?.toString(),
+        ),
       );
 
       // an older server has no resumable upload API
@@ -536,6 +582,46 @@ class BackgroundUploadService {
     }
   }
 
+  /// The asset fields both upload paths send, so the multipart and chunked paths cannot drift.
+  @visibleForTesting
+  Map<String, String> buildUploadFields({
+    required DateTime createdAt,
+    required DateTime modifiedAt,
+    required String originalFileName,
+    String? deviceAssetId,
+    bool? isFavorite,
+    Map<String, String>? fields,
+    String? cloudId,
+    String? adjustmentTime,
+    String? latitude,
+    String? longitude,
+  }) {
+    return {
+      'filename': originalFileName,
+      // deviceAssetId/deviceId required by server v2.7.5 and below (drop in v4.0 per #27818).
+      'deviceAssetId': deviceAssetId ?? '',
+      'deviceId': Store.get(StoreKey.deviceId),
+      'fileCreatedAt': createdAt.toUtc().toIso8601String(),
+      'fileModifiedAt': modifiedAt.toUtc().toIso8601String(),
+      'isFavorite': isFavorite?.toString() ?? 'false',
+      'duration': '0',
+      ...?fields,
+      if (CurrentPlatform.isIOS && cloudId != null)
+        'metadata': jsonEncode([
+          RemoteAssetMetadataItem(
+            key: RemoteAssetMetadataKey.mobileApp,
+            value: RemoteAssetMobileAppMetadata(
+              cloudId: cloudId,
+              createdAt: createdAt.toIso8601String(),
+              adjustmentTime: adjustmentTime,
+              latitude: latitude,
+              longitude: longitude,
+            ),
+          ),
+        ]),
+    };
+  }
+
   /// One tus PATCH as a single native upload task.
   ///
   /// `background_downloader` consumes the `Range` header itself to upload only that slice of the
@@ -552,12 +638,15 @@ class BackgroundUploadService {
     int? priority,
     bool requiresWiFi = true,
     int chunkSize = kUploadChunkSize,
+    int attempt = 0,
   }) async {
     final (baseDirectory, directory, filename) = await Task.split(filePath: file.path);
     final range = chunkRange(offset, total, chunkSize: chunkSize);
 
     return UploadTask(
-      taskId: '${deviceAssetId ?? filename}#$offset',
+      // the attempt counter keeps ids unique when a 409 sends the chain back to an offset it
+      // has already used; background_downloader dedupes by taskId and would drop the retry
+      taskId: '${deviceAssetId ?? filename}#$offset#$attempt',
       displayName: filename,
       httpRequestMethod: 'PATCH',
       url: uploadUrl.toString(),
@@ -607,32 +696,19 @@ class BackgroundUploadService {
     final serverEndpoint = Store.get(StoreKey.serverEndpoint);
     final url = Uri.parse('$serverEndpoint/assets').toString();
     final headers = ApiService.getRequestHeaders();
-    final deviceId = Store.get(StoreKey.deviceId);
     final (baseDirectory, directory, filename) = await Task.split(filePath: file.path);
-    final fieldsMap = {
-      'filename': originalFileName ?? filename,
-      // deviceAssetId/deviceId required by server v2.7.5 and below (drop in v4.0 per #27818).
-      'deviceAssetId': deviceAssetId ?? '',
-      'deviceId': deviceId,
-      'fileCreatedAt': createdAt.toUtc().toIso8601String(),
-      'fileModifiedAt': modifiedAt.toUtc().toIso8601String(),
-      'isFavorite': isFavorite?.toString() ?? 'false',
-      'duration': '0',
-      ...?fields,
-      if (CurrentPlatform.isIOS && cloudId != null)
-        'metadata': jsonEncode([
-          RemoteAssetMetadataItem(
-            key: RemoteAssetMetadataKey.mobileApp,
-            value: RemoteAssetMobileAppMetadata(
-              cloudId: cloudId,
-              createdAt: createdAt.toIso8601String(),
-              adjustmentTime: adjustmentTime,
-              latitude: latitude,
-              longitude: longitude,
-            ),
-          ),
-        ]),
-    };
+    final fieldsMap = buildUploadFields(
+      createdAt: createdAt,
+      modifiedAt: modifiedAt,
+      originalFileName: originalFileName ?? filename,
+      deviceAssetId: deviceAssetId,
+      isFavorite: isFavorite,
+      fields: fields,
+      cloudId: cloudId,
+      adjustmentTime: adjustmentTime,
+      latitude: latitude,
+      longitude: longitude,
+    );
 
     return UploadTask(
       taskId: deviceAssetId,

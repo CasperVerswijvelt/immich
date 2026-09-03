@@ -127,20 +127,25 @@ void main() {
 
   group('uploadFileResumable', () {
     late File large;
+    final contents = List.generate(1000, (i) => i % 251);
 
     setUpAll(() {
+      // each byte encodes its own offset, so a wrong range is detectable
       large = File('${Directory.systemTemp.createTempSync().path}/video.mp4')
-        ..writeAsBytesSync(List.filled(1000, 0x41));
+        ..writeAsBytesSync(List.generate(1000, (i) => i % 251));
     });
 
     /// Records each request so the offsets actually put on the wire can be asserted.
+    final bodies = <List<int>>[];
+
     List<http.BaseRequest> stubExchanges(List<http.StreamedResponse> Function() replies) {
       final sent = <http.BaseRequest>[];
       final queue = replies();
       var index = 0;
+      bodies.clear();
       when(() => client.send(any())).thenAnswer((invocation) async {
         final request = invocation.positionalArguments.single as http.BaseRequest;
-        await request.finalize().drain<void>();
+        bodies.add(await request.finalize().toBytes());
         sent.add(request);
         return queue[index++];
       });
@@ -180,6 +185,11 @@ void main() {
       expect(sent.first.headers['x-immich-checksum'], 'Ki3hxnotKPzthJ7hu3bnORuT6xI=');
       expect(sent.first.headers['Upload-Metadata'], contains('filename ${base64.encode(utf8.encode('video.mp4'))}'));
       expect(sent.skip(1).map((request) => request.headers['Upload-Offset']), ['0', '400', '800']);
+
+      // the ranged read is the only real logic here; identical fixture bytes would hide an error
+      expect(bodies[1], contents.sublist(0, 400));
+      expect(bodies[2], contents.sublist(400, 800));
+      expect(bodies[3], contents.sublist(800, 1000));
       expect(sent[1].headers['Content-Type'], 'application/offset+octet-stream');
       expect(sent.last.url.toString(), 'http://demo.immich.app/api/assets/upload/abc');
     });
@@ -257,6 +267,46 @@ void main() {
 
       expect(seen, [400, 800, 1000]);
       expect(seen, orderedEquals(List.of(seen)..sort()));
+    });
+
+    test('gives up rather than re-sending a chunk the server never advanced past', () async {
+      stubExchanges(
+        () => [
+          headerResponse(201, {'location': '/api/assets/upload/abc'}),
+          headerResponse(204, {'upload-offset': '0'}),
+        ],
+      );
+
+      final result = await resumable();
+
+      expect(result?.isSuccess, isFalse);
+      expect(result?.errorMessage, contains('did not advance'));
+    });
+
+    test('reports progress that never regresses when the server commits less than was sent', () async {
+      stubExchanges(
+        () => [
+          headerResponse(201, {'location': '/api/assets/upload/abc'}),
+          headerResponse(204, {'upload-offset': '600'}),
+          response(201, '{"id":"asset-id","status":"created"}'),
+        ],
+      );
+
+      final seen = <int>[];
+      await sut.uploadFileResumable(
+        file: large,
+        originalFileName: 'video.mp4',
+        checksum: 'Ki3hxnotKPzthJ7hu3bnORuT6xI=',
+        fields: const {},
+        cancelToken: null,
+        logContext: 'a1',
+        httpClient: client,
+        chunkSize: 400,
+        onProgress: (bytes, total) => seen.add(bytes),
+      );
+
+      expect(seen, orderedEquals(List.of(seen)..sort()));
+      expect(seen.last, 1000);
     });
 
     test('surfaces a 413 with a readable message', () async {
